@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -120,6 +121,7 @@ class AgentController:
                     counters.denied_actions += 1
                     counters.retries += 1
                     self._emit_progress(f"Denied model response: {error}")
+                    self._log_event(f"Denied raw model response: {raw[:2000]!r}")
                     messages.append({"role": "assistant", "content": raw})
                     messages.append({"role": "user", "content": f"ERROR: {error} No action was executed. Return one valid JSON object."})
                 else:
@@ -205,9 +207,9 @@ class AgentController:
             '{"type":"final","response":"summary"}. Tool argument schemas: list {"path":"."} (optional path), '
             'read {"path":"..."}, search {"query":"...","path":"."} (optional path), edit {"path":"...","content":"..."}. '
             "Inspect the repository's existing tests. If the requested behavior is testable, add or update relevant "
-            "regression tests and run them using available validated checks. Do not force a test-file change for tasks "
+            "regression tests with the edit tool; configured checks run automatically after your final response. Do not force a test-file change for tasks "
             "such as documentation-only work; if testing is not applicable, state why in your final response. "
-            "No markdown or prose outside the JSON object. A final response is not proof that checks passed."
+            "Reply with raw JSON only: no markdown code fences and no prose outside the JSON object. A final response is not proof that checks passed."
         )
 
     @classmethod
@@ -219,8 +221,12 @@ class AgentController:
                     raise ValueError(f"Duplicate JSON key: {key}")
                 result[key] = value
             return result
+        text = raw.strip()
+        fenced = re.fullmatch(r"```(?:json)?[ \t]*\n(.*?)\n?```", text, re.DOTALL)
+        if fenced:
+            text = fenced.group(1)
         try:
-            value = json.loads(raw, object_pairs_hook=no_duplicates)
+            value = json.loads(text, object_pairs_hook=no_duplicates)
         except (json.JSONDecodeError, ValueError) as error:
             raise ValueError(f"Response must be exactly one valid JSON object: {error}") from error
         if not isinstance(value, dict):

@@ -90,6 +90,18 @@ class ModelTaskLoopTests(unittest.TestCase):
             self.assertEqual(len(list(log_root.glob("coding-harness-task-*.log"))), 2)
             self.assertEqual(logs[0].read_text(encoding="utf-8"), contents)
 
+    def test_single_markdown_fenced_json_response_is_accepted_and_denials_log_raw_reply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fenced = "```json\n" + json.dumps({"type": "final", "response": "Done."}) + "\n```"
+            controller = AgentController(
+                ScriptedModelClient(["I will help you.", fenced]),
+                RepositoryTools(directory), Verification(PassingChecks()), task_log_directory=directory,
+            )
+            result = controller.run_task("Anything", directory)
+            self.assertEqual(result.final_response, "Done.")
+            self.assertEqual(result.counters.denied_actions, 1)
+            self.assertIn("I will help you.", controller.task_log_path.read_text(encoding="utf-8"))
+
     def test_model_request_instructs_testing_when_behavior_is_testable(self):
         with tempfile.TemporaryDirectory() as directory:
             model = ScriptedModelClient([
