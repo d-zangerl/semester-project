@@ -123,7 +123,9 @@ class AgentController:
                     self._emit_progress(f"Denied model response: {error}")
                     self._log_event(f"Denied raw model response: {raw[:2000]!r}")
                     messages.append({"role": "assistant", "content": raw})
-                    messages.append({"role": "user", "content": f"ERROR: {error} No action was executed. Return one valid JSON object."})
+                    messages.append({"role": "user", "content": f"ERROR: {error} No action was executed. Return one valid JSON object, for example "
+                                                    '{"type":"tool","tool":"edit","arguments":{"path":"relative/path","content":"full new file content"}} '
+                                                    'or {"type":"final","response":"summary"}.'})
                 else:
                     messages.append({"role": "assistant", "content": raw})
                     if action["type"] == "final":
@@ -189,11 +191,18 @@ class AgentController:
             self._log_event(f"Configured verification passed: {verification.passed}")
         else:
             self._log_event("Task ended without configured verification results.")
-        if verification is not None:
-            changed = ", ".join(verification.changed_files) or "none"
-            self._log_event(f"Task diff (changed files: {changed}; truncated={verification.diff_truncated}):")
-            self._task_log.write((verification.diff or "(no textual diff)").rstrip("\n") + "\n")
+        try:
+            if verification is not None:
+                changed_files, diff, truncated = verification.changed_files, verification.diff, verification.diff_truncated
+            else:
+                changed_files, diff, truncated = self.verification.diff(workspace, baseline)
+            self._log_event(
+                f"Task diff (changed files: {', '.join(changed_files) or 'none'}; truncated={truncated}):"
+            )
+            self._task_log.write((diff or "(no textual diff)").rstrip("\n") + "\n")
             self._task_log.flush()
+        except Exception as error:
+            self._log_event(f"Task diff unavailable: {error}")
         self._task_log.close()
         self._task_log = None
         return TaskResult(final, verification, counters, stopped)
@@ -206,7 +215,7 @@ class AgentController:
             '{"type":"tool","tool":"read","arguments":{"path":"relative/path"}} or '
             '{"type":"final","response":"summary"}. Tool argument schemas: list {"path":"."} (optional path), '
             'read {"path":"..."}, search {"query":"...","path":"."} (optional path), edit {"path":"...","content":"..."}. '
-            "Inspect the repository's existing tests. If the requested behavior is testable, add or update relevant "
+            "Start by listing the repository root with the list tool; only read paths that the list or search results showed. Create new files with the edit tool (it creates missing files). Never give up after a denied action: correct it and continue. Inspect the repository's existing tests. If the requested behavior is testable, add or update relevant "
             "regression tests with the edit tool; configured checks run automatically after your final response. Do not force a test-file change for tasks "
             "such as documentation-only work; if testing is not applicable, state why in your final response. "
             "Reply with raw JSON only: no markdown code fences and no prose outside the JSON object. A final response is not proof that checks passed."
@@ -231,6 +240,9 @@ class AgentController:
             raise ValueError(f"Response must be exactly one valid JSON object: {error}") from error
         if not isinstance(value, dict):
             raise ValueError("Response must be a JSON object.")
+        if value.get("type") == "edit" and set(value) == {"type", "path", "content"}:
+            value = {"type": "tool", "tool": "edit",
+                     "arguments": {"path": value["path"], "content": value["content"]}}
         if value.get("type") == "final" and set(value) == {"type", "response"} and isinstance(value["response"], str):
             return value
         if value.get("type") != "tool" or set(value) != {"type", "tool", "arguments"}:

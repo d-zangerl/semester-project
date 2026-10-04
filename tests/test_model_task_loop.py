@@ -102,6 +102,38 @@ class ModelTaskLoopTests(unittest.TestCase):
             self.assertEqual(result.counters.denied_actions, 1)
             self.assertIn("I will help you.", controller.task_log_path.read_text(encoding="utf-8"))
 
+    def test_flat_edit_shape_is_normalized_to_a_validated_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            model = ScriptedModelClient([
+                "```json\n" + json.dumps({"type": "edit", "path": "hello.py", "content": "x = 1\n"}) + "\n```",
+                json.dumps({"type": "final", "response": "Done."}),
+            ])
+            controller = AgentController(
+                model, RepositoryTools(workspace), Verification(PassingChecks()), task_log_directory=directory,
+            )
+            result = controller.run_task("Create hello.py", workspace)
+            self.assertEqual(result.counters.denied_actions, 0)
+            self.assertEqual(result.verification.changed_files, ("hello.py",))
+            self.assertIn("+x = 1", result.verification.diff)
+
+    def test_stopped_task_still_logs_diff_and_denial_teaches_tool_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            flat = json.dumps({"type": "edit", "path": "a.txt", "extra": "x"})
+            edit = json.dumps({"type": "tool", "tool": "edit", "arguments": {"path": "note.txt", "content": "kept"}})
+            model = ScriptedModelClient([edit, flat, flat, flat])
+            controller = AgentController(
+                model, RepositoryTools(directory), Verification(PassingChecks()), task_log_directory=directory,
+            )
+            result = controller.run_task("Anything", directory)
+            self.assertIsNotNone(result.stopped_reason)
+            log = controller.task_log_path.read_text(encoding="utf-8")
+            self.assertIn("+++ b/note.txt", log)
+            self.assertIn("+kept", log)
+            feedback = model.requests[2][-1]["content"]
+            self.assertIn('{"type":"tool","tool":"edit","arguments"', feedback)
+
     def test_model_request_instructs_testing_when_behavior_is_testable(self):
         with tempfile.TemporaryDirectory() as directory:
             model = ScriptedModelClient([

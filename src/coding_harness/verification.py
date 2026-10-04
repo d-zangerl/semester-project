@@ -36,6 +36,10 @@ class Verification:
             baseline[path.relative_to(root).as_posix()] = path.read_bytes()
         return baseline
 
+    def diff(self, workspace: str | Path, baseline: dict[str, bytes]) -> tuple[tuple[str, ...], str, bool]:
+        changes, diff, truncated = self._diff(baseline, Path(workspace).resolve(), self.diff_limit_bytes)
+        return tuple(changes), diff, truncated
+
     def verify(self, workspace: str | Path, baseline: dict[str, bytes]) -> VerificationResult:
         workspace_path = Path(workspace).resolve()
         changes, diff, truncated = self._diff(baseline, workspace_path, self.diff_limit_bytes)
