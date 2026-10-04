@@ -69,7 +69,7 @@ class ExecutionEnvironment:
         output_limit_bytes: int = 64 * 1024,
         sandbox_executable: str | None = None,
     ):
-        configured_checks = checks or {"core": (sys.executable, "tests/test_core.py")}
+        configured_checks = {"core": (sys.executable, "tests/test_core.py")} if checks is None else checks
         self._checks = {
             name: tuple(command)
             for name, command in configured_checks.items()
@@ -82,6 +82,10 @@ class ExecutionEnvironment:
         self._timeout_seconds = timeout_seconds
         self._output_limit_bytes = output_limit_bytes
         self._sandbox_executable = sandbox_executable
+
+    @property
+    def check_names(self) -> tuple[str, ...]:
+        return tuple(self._checks)
 
     def run_check(self, check_name: str, workspace: str | Path) -> CheckResult:
         started = time.monotonic()

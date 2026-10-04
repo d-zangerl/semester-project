@@ -11,6 +11,11 @@ from src.coding_harness.execution import ExecutionEnvironment
 
 
 class ExecutionEnvironmentTests(unittest.TestCase):
+    def test_explicit_empty_check_configuration_does_not_run_default_check(self):
+        runner = ExecutionEnvironment(checks={})
+
+        self.assertEqual(runner.check_names, ())
+
     def test_configured_check_is_confined_to_its_workspace(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
