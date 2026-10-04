@@ -205,16 +205,38 @@ class ModelTaskLoopTests(unittest.TestCase):
             model = ScriptedModelClient([
                 final,
                 json.dumps({"type": "tool", "tool": "read", "arguments": {"path": "a.txt"}}),
-                json.dumps({"type": "final", "response": "Inspected; nothing to change."}),
+                json.dumps({"type": "final", "response": "Inspected a.txt."}),
             ])
             controller = AgentController(
                 model, RepositoryTools(workspace), Verification(PassingChecks()),
                 task_log_directory=Path(directory) / "logs",
             )
             result = controller.run_task("Anything", workspace)
-            self.assertEqual(result.final_response, "Inspected; nothing to change.")
+            self.assertEqual(result.final_response, "Inspected a.txt.")
             self.assertEqual((result.counters.actions, result.counters.denied_actions), (1, 1))
             self.assertIn("tool", model.requests[1][-1]["content"])
+
+    def test_no_change_claim_without_any_edit_is_denied_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            (workspace / "a.txt").write_text("x", encoding="utf-8")
+            read = json.dumps({"type": "tool", "tool": "read", "arguments": {"path": "a.txt"}})
+            model = ScriptedModelClient([
+                read,
+                json.dumps({"type": "final", "response": "No changes needed."}),
+                json.dumps({"type": "tool", "tool": "edit", "arguments": {"path": "a.txt", "old": "x", "new": "y"}}),
+                json.dumps({"type": "final", "response": "Changed x to y."}),
+            ])
+            controller = AgentController(
+                model, RepositoryTools(workspace), Verification(PassingChecks()),
+                task_log_directory=Path(directory) / "logs",
+            )
+            result = controller.run_task("Change x to y", workspace)
+            self.assertEqual(result.final_response, "Changed x to y.")
+            self.assertEqual((workspace / "a.txt").read_text(encoding="utf-8"), "y")
+            self.assertEqual(result.counters.denied_actions, 1)
+            self.assertIn("edited nothing", model.requests[2][-1]["content"])
 
     def test_edit_replace_changes_one_exact_snippet_and_rejects_ambiguous_or_missing_snippets(self):
         with tempfile.TemporaryDirectory() as directory:

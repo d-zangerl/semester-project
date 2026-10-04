@@ -99,6 +99,9 @@ class AgentController:
         stopped = None
         verification = None
         premature_final_denied = False
+        no_change_denied = False
+        edited = False
+        edited = False
         while counters.responses < self.limits.responses:
             self._emit_progress(f"Requesting model response ({counters.responses + 1}/{self.limits.responses})")
             try:
@@ -140,6 +143,18 @@ class AgentController:
                             "ERROR: You have not used any tool yet, so nothing was inspected or changed. Use the list, "
                             "search, read, or edit tools first, then send a final response describing what you actually did.")})
                         continue
+                    if (action["type"] == "final" and not edited and not no_change_denied
+                            and re.search(r"no (further )?changes?\b|nothing to (change|do)|already", action["response"], re.I)):
+                        no_change_denied = True
+                        counters.denied_actions += 1
+                        counters.retries += 1
+                        self._emit_progress("Denied final response: claims no change is needed, but nothing was edited.")
+                        self._log_event("Denied no-change final response before any edit.")
+                        messages.append({"role": "user", "content": (
+                            "ERROR: You claimed no change is needed, but the task asks for a change and you edited nothing. "
+                            "Use search to find the code, read a small line range, then edit with old/new. "
+                            "Repeat your final response only if the change really exists already.")})
+                        continue
                     if action["type"] == "final":
                         self._log_event(f"Model response {counters.responses} accepted as a final response.")
                         final = action["response"]
@@ -171,6 +186,8 @@ class AgentController:
                     tool_name, arguments = action["tool"], action["arguments"]
                     try:
                         result = self._execute(tool_name, arguments)
+                        edited = edited or tool_name == "edit"
+                        edited = edited or tool_name == "edit"
                         counters.actions += 1
                         self._emit_progress(f"Tool action {counters.actions}/{self.limits.actions}: {tool_name}")
                         encoded = json.dumps(result, ensure_ascii=False)
