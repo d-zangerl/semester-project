@@ -32,6 +32,7 @@ class TaskResult:
     verification: object | None
     counters: RunCounters
     stopped_reason: str | None = None
+    baseline: dict | None = None
 
     @property
     def verification_passed(self) -> bool:
@@ -205,7 +206,7 @@ class AgentController:
             self._log_event(f"Task diff unavailable: {error}")
         self._task_log.close()
         self._task_log = None
-        return TaskResult(final, verification, counters, stopped)
+        return TaskResult(final, verification, counters, stopped, baseline)
 
     @staticmethod
     def _system_prompt() -> str:

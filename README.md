@@ -20,7 +20,18 @@ python3 src/main.py --repository ./target-repository
 
 No harness package installation is needed. The default configured check is `python3 tests/test_core.py`, run only inside the macOS `sandbox-exec` sandbox. On a platform without the supported sandbox, or if its boundary probe fails, verification is reported unavailable and repository code is not run.
 
-At the `Task>` prompt, enter a task, `/help`, or `/quit`. Multiple tasks can be submitted in one process; each task receives a fresh file copy and an empty model conversation. Review the printed diff and check results. Each task also creates a separate root-level `coding-harness-task-<unique-id>.log`, reports its path when it starts, and appends timestamped progress, model steps, tool actions/results, verification output, counters, and failures as they happen, and ends with the final unified diff of the task (as readable text, size-bounded like the printed diff). The log remains available after the task and is ignored by Git. Logs can contain task text, model/tool output, repository snippets, and check output; keep them private and remove them when no longer needed. Task workspaces are retained at the shown path for inspection; this delivery does not apply changes to the configured repository and has no approval/apply workflow.
+At the `Task>` prompt, enter a task, `/help`, or `/quit`. Multiple tasks can be submitted in one process; each task receives a fresh file copy and an empty model conversation. Review the printed diff and check results. Each task also creates a separate root-level `coding-harness-task-<unique-id>.log`, reports its path when it starts, and appends timestamped progress, model steps, tool actions/results, verification output, counters, and failures as they happen, and ends with the final unified diff of the task (as readable text, size-bounded like the printed diff). The log remains available after the task and is ignored by Git. Logs can contain task text, model/tool output, repository snippets, and check output; keep them private and remove them when no longer needed.
+
+### Reviewing and applying a result
+
+When a task changes files, a `Review>` prompt follows the diff and check results:
+
+- `/diff` shows the diff and check results again; nothing is applied until you decide.
+- `/reject` leaves the configured repository unchanged and removes the task workspace if its checks passed (otherwise it is kept and its path printed).
+- `/approve` copies every changed file into the configured repository. If the repository changed since the task started, a `WARNING` lists the differing files first and the task's files are still force-applied over them. The core check then runs in the sandbox on a fresh copy of the updated repository (never directly in it); its output and exit code are printed. On success both workspaces are removed. On a failed, timed-out, or unavailable check the workspaces are retained and their paths printed. The harness exits non-zero if any task or post-apply check did not pass.
+- Ending input (Ctrl-D) during review applies nothing and keeps the workspace.
+
+The harness has no tool to delete files, so applied changes are file creations and edits.
 
 ## Collaborators and flow
 
