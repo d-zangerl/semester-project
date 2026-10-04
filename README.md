@@ -141,6 +141,10 @@ flowchart TD
   E -->|fail / timeout / unavailable| G[Keep workspaces, print paths]
 ```
 
+## Real-model demo
+
+`python3 demo/run_demo.py` runs the harness against a fresh copy of `target-repository` with a fixed demo task (reject quote lines with a quantity of zero or less in `quotes.py`). It first proves that the external acceptance check `demo/accept_quote.py` fails on the untouched copy, then you type the task, review the diff and `/approve` or `/reject`, then `/quit`. Afterwards it re-runs the acceptance check and the configured `core` check in the sandbox and writes `demo-record-*.md` (git-ignored) with the verdict. Suggested task wording: `In quotes.py, in create_quote, directly after the line price = float(e.get("price") or 0) add a new check: if qty <= 0 then raise ValueError("Quote line quantity must be positive."). Do not change anything else.` A 7B model is not deterministic: in rehearsal about one run in three succeeded; a failing run is reported honestly (reject it and try again).
+
 ## Safety and limits
 
 **The disposable copy is not the sandbox.** It only keeps edits away from the target until you approve. Isolation of repository code comes from the OS sandbox:

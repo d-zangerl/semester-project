@@ -26,15 +26,15 @@ from coding_harness.verification import Verification  # noqa: E402
 from coding_harness.workspace import create_task_workspace  # noqa: E402
 
 TARGET = ROOT / "target-repository"
-ACCEPTANCE = Path(__file__).resolve().parent / "accept_transfer.py"
-TASK = "Reject transfers with a zero or negative quantity so stock can never be moved backwards."
-EXPECTED = ("A transfer line with qty <= 0 raises OperationError and changes nothing; "
-            "positive transfers keep working; existing core tests still pass.")
-SCOPE = ("operations.py (required); app.py and files under tests/ (optional). "
+ACCEPTANCE = Path(__file__).resolve().parent / "accept_quote.py"
+TASK = "In quotes.py, make create_quote raise ValueError(\"Quote line quantity must be positive.\") when a line has a quantity of zero or less."
+EXPECTED = ("A quote line with qty <= 0 raises ValueError and nothing is stored; "
+            "positive quotes keep working; existing core tests still pass.")
+SCOPE = ("quotes.py (required); files under tests/ (optional). "
          "No other files, no database or config changes.")
-ALLOWED = ("operations.py", "app.py")
+ALLOWED = ("quotes.py",)
 ALLOWED_PREFIX = ("tests/",)
-ACCEPTANCE_DEST = ".harness-acceptance/accept_transfer.py"
+ACCEPTANCE_DEST = ".harness-acceptance/accept_quote.py"
 
 
 def run_in_fresh_copy(environment: ExecutionEnvironment, repository: Path, check_name: str, with_acceptance: bool):
@@ -99,7 +99,7 @@ def main() -> int:
         "- Task: " + TASK,
         "- Expected behavior: " + EXPECTED,
         "- Permitted scope: " + SCOPE,
-        "- Acceptance check: `demo/accept_transfer.py` (outside the workspace; copied in only for each run)",
+        "- Acceptance check: `demo/accept_quote.py` (outside the workspace; copied in only for each run)",
         "- Baseline acceptance (before model): " + status(baseline),
         "- Final acceptance (after model): " + status(final_acceptance),
         "- Configured regression check (core): " + status(final_core),

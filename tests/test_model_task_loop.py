@@ -238,6 +238,25 @@ class ModelTaskLoopTests(unittest.TestCase):
             self.assertEqual(result.counters.denied_actions, 1)
             self.assertIn("edited nothing", model.requests[2][-1]["content"])
 
+    def test_invalid_tool_arguments_denial_names_the_required_and_allowed_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            model = ScriptedModelClient([
+                LIST,
+                json.dumps({"type": "tool", "tool": "search", "arguments": {"pattern": "x"}}),
+                json.dumps({"type": "final", "response": "Stopping."}),
+            ])
+            controller = AgentController(
+                model, RepositoryTools(workspace), Verification(PassingChecks()),
+                task_log_directory=Path(directory) / "logs",
+            )
+            controller.run_task("Anything", workspace)
+            feedback = model.requests[2][-1]["content"]
+            self.assertIn("requires 'query'", feedback)
+            self.assertIn("'path'", feedback)
+            self.assertIn("unexpected 'pattern'", feedback)
+
     def test_edit_replace_changes_one_exact_snippet_and_rejects_ambiguous_or_missing_snippets(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / "workspace"

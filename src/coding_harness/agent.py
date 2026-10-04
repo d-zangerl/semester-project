@@ -284,8 +284,15 @@ class AgentController:
         if name not in schemas:
             raise ValueError(f"Unknown tool: {name!r}")
         required, allowed = schemas[name]
-        if not isinstance(args, dict) or not required <= args.keys() or not args.keys() <= allowed:
-            raise ValueError(f"Invalid arguments for tool {name!r}.")
+        if not isinstance(args, dict):
+            raise ValueError(f"Arguments for tool {name!r} must be a JSON object.")
+        if not required <= args.keys() or not args.keys() <= allowed:
+            missing = ", ".join(repr(key) for key in sorted(required - args.keys()))
+            extra = ", ".join(repr(key) for key in sorted(args.keys() - allowed))
+            raise ValueError(
+                f"Invalid arguments for tool {name!r}: it requires {', '.join(map(repr, sorted(required))) or 'no arguments'} "
+                f"and optionally {', '.join(map(repr, sorted(allowed - required))) or 'nothing'}."
+                + (f" Missing {missing}." if missing else "") + (f" Remove unexpected {extra}." if extra else ""))
         if name in {"list", "read"} and not isinstance(args.get("path", "."), str):
             raise ValueError("Path argument must be text.")
         if name == "search" and (not isinstance(args["query"], str) or not isinstance(args.get("path", "."), str)):
