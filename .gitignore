@@ -1,0 +1,3 @@
+coding-harness-task-*.log
+demo-record-*.md
+src/coding_harness/__pycache__/*
