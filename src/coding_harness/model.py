@@ -7,6 +7,20 @@ from urllib.parse import urlsplit
 from typing import Any
 
 
+ACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string", "enum": ["tool", "final"]},
+        "tool": {"type": "string", "enum": ["list", "read", "search", "edit"]},
+        "arguments": {"type": "object", "properties": {
+            "path": {"type": "string"}, "query": {"type": "string"}, "content": {"type": "string"},
+        }},
+        "response": {"type": "string"},
+    },
+    "required": ["type"],
+}
+
+
 class ModelClient:
     """Minimal non-streaming Ollama chat adapter."""
 
@@ -21,7 +35,7 @@ class ModelClient:
         self.timeout_seconds = timeout_seconds
 
     def request(self, messages: list[dict[str, str]]) -> str:
-        body = json.dumps({"model": self.model, "messages": messages, "stream": False}).encode("utf-8")
+        body = json.dumps({"model": self.model, "messages": messages, "stream": False, "format": ACTION_SCHEMA}).encode("utf-8")
         request = urllib.request.Request(
             f"{self.endpoint}/api/chat", data=body,
             headers={"Content-Type": "application/json"}, method="POST",

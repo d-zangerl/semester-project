@@ -394,6 +394,9 @@ class OllamaContractTests(unittest.TestCase):
         self.assertEqual(seen["path"], "/api/chat")
         self.assertEqual(seen["body"]["model"], "test-model")
         self.assertFalse(seen["body"]["stream"])
+        action_schema = seen["body"]["format"]
+        self.assertEqual(action_schema["properties"]["type"]["enum"], ["tool", "final"])
+        self.assertEqual(action_schema["properties"]["tool"]["enum"], ["list", "read", "search", "edit"])
         self.assertEqual(seen["body"]["messages"], [{"role": "user", "content": "task"}])
 
     def test_model_client_rejects_nonlocal_endpoints(self):
