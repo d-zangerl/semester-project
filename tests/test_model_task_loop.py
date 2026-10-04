@@ -134,6 +134,49 @@ class ModelTaskLoopTests(unittest.TestCase):
             feedback = model.requests[2][-1]["content"]
             self.assertIn('{"type":"tool","tool":"edit","arguments"', feedback)
 
+    def test_list_without_a_path_lists_the_workspace_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            (workspace / "a.txt").write_text("x", encoding="utf-8")
+            model = ScriptedModelClient([
+                json.dumps({"type": "tool", "tool": "list", "arguments": {}}),
+                json.dumps({"type": "final", "response": "Done."}),
+            ])
+            controller = AgentController(
+                model, RepositoryTools(workspace), Verification(PassingChecks()),
+                task_log_directory=Path(directory) / "logs",
+            )
+            result = controller.run_task("List files", workspace)
+            self.assertEqual(result.counters.actions, 1)
+            self.assertIn("a.txt", model.requests[1][-1]["content"])
+
+    def test_edit_replace_changes_one_exact_snippet_and_rejects_ambiguous_or_missing_snippets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            (workspace / "code.py").write_text("a = 1\nb = 2\nb = 2\n", encoding="utf-8")
+
+            def edit(**arguments):
+                return json.dumps({"type": "tool", "tool": "edit", "arguments": {"path": "code.py", **arguments}})
+
+            model = ScriptedModelClient([
+                edit(old="b = 2", new="b = 3"),
+                edit(old="a = 1", new="a = 9"),
+                edit(old="zzz", new="y"),
+                json.dumps({"type": "final", "response": "Done."}),
+            ])
+            controller = AgentController(
+                model, RepositoryTools(workspace), Verification(PassingChecks()),
+                task_log_directory=Path(directory) / "logs",
+            )
+            result = controller.run_task("Change code", workspace)
+
+            self.assertEqual((workspace / "code.py").read_text(encoding="utf-8"), "a = 9\nb = 2\nb = 2\n")
+            self.assertEqual(result.counters.actions, 1)
+            self.assertEqual(result.counters.denied_actions, 2)
+            self.assertIn("+a = 9", result.verification.diff)
+
     def test_model_request_instructs_testing_when_behavior_is_testable(self):
         with tempfile.TemporaryDirectory() as directory:
             model = ScriptedModelClient([
@@ -397,6 +440,7 @@ class OllamaContractTests(unittest.TestCase):
         action_schema = seen["body"]["format"]
         self.assertEqual(action_schema["properties"]["type"]["enum"], ["tool", "final"])
         self.assertEqual(action_schema["properties"]["tool"]["enum"], ["list", "read", "search", "edit"])
+        self.assertLessEqual({"old", "new"}, set(action_schema["properties"]["arguments"]["properties"]))
         self.assertEqual(seen["body"]["messages"], [{"role": "user", "content": "task"}])
 
     def test_model_client_rejects_nonlocal_endpoints(self):

@@ -79,6 +79,18 @@ class RepositoryTools:
         file.write_text(content, encoding="utf-8")
         return {"path": file.relative_to(self.workspace).as_posix(), "bytes_written": len(content.encode("utf-8"))}
 
+    def replace_in_file(self, path: str, old: str, new: str) -> dict:
+        file = self._resolve(path)
+        if self._excluded(file) or not file.is_file():
+            raise ValueError("Edit path must identify an allowed file.")
+        if not isinstance(old, str) or not isinstance(new, str) or not old:
+            raise ValueError("Replace needs non-empty 'old' text and text 'new'.")
+        text = self.read_file(path)["content"]
+        found = text.count(old)
+        if found != 1:
+            raise ValueError(f"'old' must match exactly once in {path} (found {found}); include more surrounding text.")
+        return self.edit_file(path, text.replace(old, new, 1))
+
     def _resolve(self, path: str, *, allow_missing: bool = False) -> Path:
         if not isinstance(path, str) or not path or "\x00" in path:
             raise ValueError("Path must be a non-empty workspace-relative path.")

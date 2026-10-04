@@ -21,6 +21,14 @@ class ScriptedModelClient:
 
 
 class CommandLineTests(unittest.TestCase):
+    def test_model_request_timeout_is_configurable_and_allows_slow_local_models(self):
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("CODING_HARNESS_OLLAMA_TIMEOUT", None)
+            self.assertEqual(UserInterface._model_client().timeout_seconds, 300)
+            os.environ["CODING_HARNESS_OLLAMA_TIMEOUT"] = "12"
+            self.assertEqual(UserInterface._model_client().timeout_seconds, 12)
+
     def run_fixture(self, check_source):
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)

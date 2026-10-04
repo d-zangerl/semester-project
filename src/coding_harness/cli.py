@@ -180,7 +180,8 @@ class UserInterface:
     def _model_client() -> ModelClient:
         endpoint = os.environ.get("CODING_HARNESS_OLLAMA_ENDPOINT", "http://localhost:11434")
         model = os.environ.get("CODING_HARNESS_OLLAMA_MODEL", "qwen2.5-coder:7b")
-        return ModelClient(endpoint, model)
+        timeout = float(os.environ.get("CODING_HARNESS_OLLAMA_TIMEOUT", "300"))
+        return ModelClient(endpoint, model, timeout_seconds=timeout)
 
     @staticmethod
     def _show_help() -> None:

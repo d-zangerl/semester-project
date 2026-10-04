@@ -14,6 +14,7 @@ ACTION_SCHEMA = {
         "tool": {"type": "string", "enum": ["list", "read", "search", "edit"]},
         "arguments": {"type": "object", "properties": {
             "path": {"type": "string"}, "query": {"type": "string"}, "content": {"type": "string"},
+            "old": {"type": "string"}, "new": {"type": "string"},
         }},
         "response": {"type": "string"},
     },

@@ -21,6 +21,7 @@ All settings are optional. Example (copy into your shell; there are no keys or t
 export CODING_HARNESS_OLLAMA_ENDPOINT=http://localhost:11434
 export CODING_HARNESS_OLLAMA_MODEL=qwen2.5-coder:7b
 export CODING_HARNESS_REPOSITORY=./target-repository
+export CODING_HARNESS_OLLAMA_TIMEOUT=300   # seconds per model request (slow local models need minutes)
 ```
 
 ## Run
