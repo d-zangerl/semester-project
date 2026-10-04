@@ -15,6 +15,7 @@ ACTION_SCHEMA = {
         "arguments": {"type": "object", "properties": {
             "path": {"type": "string"}, "query": {"type": "string"}, "content": {"type": "string"},
             "old": {"type": "string"}, "new": {"type": "string"},
+            "start": {"type": "integer"}, "end": {"type": "integer"},
         }},
         "response": {"type": "string"},
     },

@@ -98,6 +98,7 @@ class AgentController:
         final = ""
         stopped = None
         verification = None
+        premature_final_denied = False
         while counters.responses < self.limits.responses:
             self._emit_progress(f"Requesting model response ({counters.responses + 1}/{self.limits.responses})")
             try:
@@ -129,6 +130,16 @@ class AgentController:
                                                     'or {"type":"final","response":"summary"}.'})
                 else:
                     messages.append({"role": "assistant", "content": raw})
+                    if action["type"] == "final" and counters.actions == 0 and not premature_final_denied:
+                        premature_final_denied = True
+                        counters.denied_actions += 1
+                        counters.retries += 1
+                        self._emit_progress("Denied final response: no repository tool was used yet.")
+                        self._log_event("Denied final response before any tool action.")
+                        messages.append({"role": "user", "content": (
+                            "ERROR: You have not used any tool yet, so nothing was inspected or changed. Use the list, "
+                            "search, read, or edit tools first, then send a final response describing what you actually did.")})
+                        continue
                     if action["type"] == "final":
                         self._log_event(f"Model response {counters.responses} accepted as a final response.")
                         final = action["response"]
@@ -215,8 +226,8 @@ class AgentController:
             "Use only the list, read, search, and edit tools. Every response must be exactly one JSON object: "
             '{"type":"tool","tool":"read","arguments":{"path":"relative/path"}} or '
             '{"type":"final","response":"<one sentence describing what you actually changed>"}. Send a final response only after your edit tool call succeeded (unless no change is needed). Tool argument schemas: list {"path":"."} (optional path), '
-            'read {"path":"..."}, search {"query":"...","path":"."} (optional path), edit {"path":"...","content":"..."} to write a whole (small or new) file, or edit {"path":"...","old":"exact existing snippet","new":"replacement"} to change one snippet that occurs exactly once (preferred for existing or large files). '
-            "Start by listing the repository root with the list tool; only read paths that the list or search results showed. For large files do not read the whole file: use search to find the exact line(s) you need, then change them with edit old/new. Create new files with the edit tool (it creates missing files). Never give up after a denied action: correct it and continue. Inspect the repository's existing tests. If the requested behavior is testable, add or update relevant "
+            'read {"path":"...","start":1,"end":200} (optional 1-based inclusive line range; at most 200 lines are returned per read, the result tells you the total line count), search {"query":"...","path":"."} (optional path), edit {"path":"...","content":"..."} to write a whole (small or new) file, or edit {"path":"...","old":"exact existing snippet","new":"replacement"} to change one snippet that occurs exactly once (preferred for existing or large files). '
+            "Start by listing the repository root with the list tool; only read paths that the list or search results showed. For large files use search to find the line number you need, then read a small line range around it, then change it with edit old/new. Create new files with the edit tool (it creates missing files). Never give up after a denied action: correct it and continue. Inspect the repository's existing tests. If the requested behavior is testable, add or update relevant "
             "regression tests with the edit tool; configured checks run automatically after your final response. Do not force a test-file change for tasks "
             "such as documentation-only work; if testing is not applicable, state why in your final response. "
             "Reply with raw JSON only: no markdown code fences and no prose outside the JSON object. A final response is not proof that checks passed."
@@ -251,7 +262,7 @@ class AgentController:
         name, args = value["tool"], value["arguments"]
         if not isinstance(name, str):
             raise ValueError("Tool name must be text.")
-        schemas = {"list": (set(), {"path"}), "read": ({"path"}, {"path"}),
+        schemas = {"list": (set(), {"path"}), "read": ({"path"}, {"path", "start", "end"}),
                    "search": ({"query"}, {"query", "path"}), "edit": ({"path"}, {"path", "content", "old", "new"})}
         if name not in schemas:
             raise ValueError(f"Unknown tool: {name!r}")
@@ -274,7 +285,7 @@ class AgentController:
         if name == "list":
             return self.repository_tools.list_files(args.get("path", "."))
         if name == "read":
-            return self.repository_tools.read_file(args["path"])
+            return self.repository_tools.read_file(args["path"], args.get("start"), args.get("end"))
         if name == "search":
             return self.repository_tools.search(args["query"], args.get("path", "."))
         if name == "edit":

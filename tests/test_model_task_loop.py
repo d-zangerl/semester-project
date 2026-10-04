@@ -16,6 +16,9 @@ from src.coding_harness.repository import RepositoryTools
 from src.coding_harness.verification import Verification
 
 
+LIST = json.dumps({"type": "tool", "tool": "list", "arguments": {}})
+
+
 class ScriptedModelClient:
     def __init__(self, responses):
         self.responses = iter(responses)
@@ -51,17 +54,19 @@ class ModelTaskLoopTests(unittest.TestCase):
                     "path": "note.txt", "content": "updated",
                 }}),
                 json.dumps({"type": "final", "response": "Updated the note."}),
+                LIST,
                 json.dumps({"type": "final", "response": "Second task complete."}),
             ])
             visible_during_progress = []
+            second_task_started = []
 
             def observe_progress(message):
-                if message.startswith("Tool action"):
+                if message.startswith("Tool action") and not second_task_started:
                     logs = list(log_root.glob("coding-harness-task-*.log"))
                     self.assertEqual(len(logs), 1)
                     visible_during_progress.append(logs[0].read_text(encoding="utf-8"))
                     self.assertIn(message, visible_during_progress[-1])
-                if message == "Requesting model response (2/40)":
+                if message == "Requesting model response (2/40)" and not second_task_started:
                     log_text = next(log_root.glob("coding-harness-task-*.log")).read_text(encoding="utf-8")
                     self.assertIn("Tool result for edit", log_text)
 
@@ -86,15 +91,16 @@ class ModelTaskLoopTests(unittest.TestCase):
             self.assertIn("+++ b/note.txt", contents)
             self.assertIn("+updated", contents)
             self.assertTrue(result.verification_passed)
+            second_task_started.append(True)
             controller.run_task("Second independent task", workspace)
             self.assertEqual(len(list(log_root.glob("coding-harness-task-*.log"))), 2)
             self.assertEqual(logs[0].read_text(encoding="utf-8"), contents)
 
     def test_single_markdown_fenced_json_response_is_accepted_and_denials_log_raw_reply(self):
         with tempfile.TemporaryDirectory() as directory:
-            fenced = "```json\n" + json.dumps({"type": "final", "response": "Done."}) + "\n```"
+            fenced = "```json\n" + LIST + "\n```"
             controller = AgentController(
-                ScriptedModelClient(["I will help you.", fenced]),
+                ScriptedModelClient(["I will help you.", fenced, json.dumps({"type": "final", "response": "Done."})]),
                 RepositoryTools(directory), Verification(PassingChecks()), task_log_directory=directory,
             )
             result = controller.run_task("Anything", directory)
@@ -151,6 +157,65 @@ class ModelTaskLoopTests(unittest.TestCase):
             self.assertEqual(result.counters.actions, 1)
             self.assertIn("a.txt", model.requests[1][-1]["content"])
 
+    def test_read_line_range_and_long_files_are_returned_in_bounded_slices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            (workspace / "big.py").write_text("".join(f"line {n}\n" for n in range(1, 501)), encoding="utf-8")
+            (workspace / "small.py").write_text("a\nb\n", encoding="utf-8")
+
+            def read(**arguments):
+                return json.dumps({"type": "tool", "tool": "read", "arguments": arguments})
+
+            model = ScriptedModelClient([
+                read(path="big.py", start=250, end=252),
+                read(path="big.py"),
+                read(path="small.py"),
+                read(path="big.py", start=0, end=5),
+                read(path="big.py", start="1", end=5),
+                json.dumps({"type": "final", "response": "Done."}),
+            ])
+            controller = AgentController(
+                model, RepositoryTools(workspace), Verification(PassingChecks()),
+                task_log_directory=Path(directory) / "logs",
+            )
+            result = controller.run_task("Inspect", workspace)
+
+            ranged = json.loads(model.requests[1][-1]["content"].removeprefix("Tool result: "))
+            self.assertEqual(ranged["content"], "line 250\nline 251\nline 252\n")
+            self.assertEqual((ranged["start"], ranged["end"], ranged["total_lines"]), (250, 252, 500))
+            unranged = json.loads(model.requests[2][-1]["content"].removeprefix("Tool result: "))
+            self.assertTrue(unranged["truncated"])
+            self.assertEqual(unranged["total_lines"], 500)
+            self.assertTrue(unranged["content"].startswith("line 1\n"))
+            self.assertLess(unranged["end"], 500)
+            self.assertIn("start", unranged["note"])
+            small = json.loads(model.requests[3][-1]["content"].removeprefix("Tool result: "))
+            self.assertEqual(small["content"], "a\nb\n")
+            self.assertFalse(small["truncated"])
+            self.assertEqual(result.counters.actions, 3)
+            self.assertEqual(result.counters.denied_actions, 2)
+
+    def test_final_response_before_any_tool_action_is_denied_once_and_must_follow_inspection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            (workspace / "a.txt").write_text("x", encoding="utf-8")
+            final = json.dumps({"type": "final", "response": "Done without looking."})
+            model = ScriptedModelClient([
+                final,
+                json.dumps({"type": "tool", "tool": "read", "arguments": {"path": "a.txt"}}),
+                json.dumps({"type": "final", "response": "Inspected; nothing to change."}),
+            ])
+            controller = AgentController(
+                model, RepositoryTools(workspace), Verification(PassingChecks()),
+                task_log_directory=Path(directory) / "logs",
+            )
+            result = controller.run_task("Anything", workspace)
+            self.assertEqual(result.final_response, "Inspected; nothing to change.")
+            self.assertEqual((result.counters.actions, result.counters.denied_actions), (1, 1))
+            self.assertIn("tool", model.requests[1][-1]["content"])
+
     def test_edit_replace_changes_one_exact_snippet_and_rejects_ambiguous_or_missing_snippets(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / "workspace"
@@ -163,7 +228,7 @@ class ModelTaskLoopTests(unittest.TestCase):
             model = ScriptedModelClient([
                 edit(old="b = 2", new="b = 3"),
                 edit(old="a = 1", new="a = 9"),
-                edit(old="zzz", new="y"),
+                edit(old=" a = 9", new="y"),
                 json.dumps({"type": "final", "response": "Done."}),
             ])
             controller = AgentController(
@@ -176,6 +241,9 @@ class ModelTaskLoopTests(unittest.TestCase):
             self.assertEqual(result.counters.actions, 1)
             self.assertEqual(result.counters.denied_actions, 2)
             self.assertIn("+a = 9", result.verification.diff)
+            feedback = [request[-1]["content"] for request in model.requests]
+            self.assertIn("lines 2, 3", feedback[1])
+            self.assertIn("line 1", feedback[3])
 
     def test_model_request_instructs_testing_when_behavior_is_testable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -220,7 +288,9 @@ class ModelTaskLoopTests(unittest.TestCase):
     def test_each_task_starts_with_only_its_own_prompt(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             model = ScriptedModelClient([
+                LIST,
                 json.dumps({"type": "final", "response": "first"}),
+                LIST,
                 json.dumps({"type": "final", "response": "second"}),
             ])
             controller = AgentController(model, RepositoryTools(first), Verification(PassingChecks()))
@@ -228,10 +298,10 @@ class ModelTaskLoopTests(unittest.TestCase):
             controller.run_task("first task", first)
             controller.run_task("second task", second)
 
-            self.assertEqual(len(model.requests), 2)
+            self.assertEqual(len(model.requests), 4)
             self.assertIn("first task", model.requests[0][1]["content"])
-            self.assertNotIn("first task", json.dumps(model.requests[1]))
-            self.assertIn("second task", model.requests[1][1]["content"])
+            self.assertNotIn("first task", json.dumps(model.requests[2]))
+            self.assertIn("second task", model.requests[2][1]["content"])
 
     def test_invalid_and_unknown_actions_are_denied_without_execution_and_limited(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -290,7 +360,7 @@ class ModelTaskLoopTests(unittest.TestCase):
                 raise OSError("sandbox unavailable")
 
         with tempfile.TemporaryDirectory() as directory:
-            model = ScriptedModelClient([json.dumps({"type": "final", "response": "Done."})])
+            model = ScriptedModelClient([LIST, json.dumps({"type": "final", "response": "Done."})])
             result = AgentController(
                 model, RepositoryTools(directory), Verification(UnavailableChecks())
             ).run_task("Inspect", directory)
@@ -328,7 +398,7 @@ class ModelTaskLoopTests(unittest.TestCase):
                 })()
 
         with tempfile.TemporaryDirectory() as directory:
-            model = ScriptedModelClient([json.dumps({"type": "final", "response": "Everything passed."})])
+            model = ScriptedModelClient([LIST, json.dumps({"type": "final", "response": "Everything passed."})])
             result = AgentController(model, RepositoryTools(directory), Verification(FailedChecks())).run_task(
                 "Inspect", directory
             )
@@ -467,7 +537,9 @@ class InteractiveCliTests(unittest.TestCase):
                 return workspace
 
             model = ScriptedModelClient([
+                LIST,
                 json.dumps({"type": "final", "response": "first finished"}),
+                LIST,
                 json.dumps({"type": "final", "response": "second finished"}),
             ])
             interface = UserInterface(
@@ -483,8 +555,8 @@ class InteractiveCliTests(unittest.TestCase):
             self.assertEqual(len(workspaces), 2)
             self.assertNotEqual(workspaces[0], workspaces[1])
             self.assertIn("first task", model.requests[0][1]["content"])
-            self.assertNotIn("first task", json.dumps(model.requests[1]))
-            self.assertIn("second task", model.requests[1][1]["content"])
+            self.assertNotIn("first task", json.dumps(model.requests[2]))
+            self.assertIn("second task", model.requests[2][1]["content"])
             self.assertIn("first finished", output.getvalue())
             self.assertIn("second finished", output.getvalue())
             self.assertEqual((repository / "original.txt").read_text(encoding="utf-8"), "base")

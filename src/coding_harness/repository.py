@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 from pathlib import Path
 
 
@@ -11,13 +12,16 @@ class RepositoryTools:
     _secret_names = {".env", ".env.local", "id_rsa", "id_ed25519", "credentials", "secrets.json"}
     _excluded_suffixes = {".pyc", ".sqlite", ".db", ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip"}
 
-    def __init__(self, workspace: str | Path, *, max_file_bytes: int = 256 * 1024, max_results: int = 200):
+    def __init__(self, workspace: str | Path, *, max_file_bytes: int = 256 * 1024, max_results: int = 200,
+                 read_window_lines: int = 200):
         self.workspace = Path(workspace).resolve(strict=True)
         self.max_file_bytes = max_file_bytes
+        self.read_window_lines = read_window_lines
         self.max_results = max_results
 
     def for_workspace(self, workspace: str | Path) -> "RepositoryTools":
-        return RepositoryTools(workspace, max_file_bytes=self.max_file_bytes, max_results=self.max_results)
+        return RepositoryTools(workspace, max_file_bytes=self.max_file_bytes, max_results=self.max_results,
+                               read_window_lines=self.read_window_lines)
 
     def list_files(self, path: str = ".") -> dict:
         directory = self._resolve(path)
@@ -32,7 +36,7 @@ class RepositoryTools:
                 break
         return {"entries": entries, "truncated": len(entries) == self.max_results}
 
-    def read_file(self, path: str) -> dict:
+    def read_file(self, path: str, start: int | None = None, end: int | None = None) -> dict:
         file = self._resolve(path)
         if not file.is_file() or self._excluded(file):
             raise ValueError("Read path must identify an allowed file.")
@@ -43,7 +47,25 @@ class RepositoryTools:
             content = data.decode("utf-8")
         except UnicodeDecodeError as error:
             raise ValueError("Binary files cannot be read as text.") from error
-        return {"path": file.relative_to(self.workspace).as_posix(), "content": content}
+        lines = content.splitlines(True)
+        total = len(lines)
+        explicit = start is not None or end is not None
+        for value in (start, end):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+                raise ValueError("Line numbers must be integers.")
+        first = 1 if start is None else start
+        last = min(total, first + self.read_window_lines - 1) if end is None else end
+        if first < 1 or last < first:
+            raise ValueError("Line range must satisfy 1 <= start <= end.")
+        last = min(last, total, first + self.read_window_lines - 1)
+        truncated = last < total and not (explicit and end is not None and end <= last)
+        result = {"path": file.relative_to(self.workspace).as_posix(),
+                  "content": "".join(lines[first - 1:last]), "start": first, "end": last,
+                  "total_lines": total, "truncated": truncated}
+        if truncated:
+            result["note"] = (f"Only lines {first}-{last} of {total} are shown; read more with "
+                              f'{{"path":"...","start":{last + 1},"end":{min(total, last + self.read_window_lines)}}}.')
+        return result
 
     def search(self, query: str, path: str = ".") -> dict:
         if not isinstance(query, str) or not query or len(query) > 500:
@@ -87,8 +109,15 @@ class RepositoryTools:
             raise ValueError("Replace needs non-empty 'old' text and text 'new'.")
         text = self.read_file(path)["content"]
         found = text.count(old)
-        if found != 1:
-            raise ValueError(f"'old' must match exactly once in {path} (found {found}); include more surrounding text.")
+        if found > 1:
+            numbers = [str(text.count("\n", 0, match.start()) + 1) for match in re.finditer(re.escape(old), text)]
+            raise ValueError(f"'old' matches {found} times in {path} (lines {', '.join(numbers[:10])}); "
+                             "include neighbouring lines so it matches exactly once.")
+        if found == 0:
+            near = [str(number) for number, line in enumerate(text.splitlines(), 1)
+                    if old.strip().splitlines() and old.strip().splitlines()[0].strip() == line.strip()]
+            hint = f" A line with the same text but different whitespace is at line {', '.join(near[:10])}." if near else ""
+            raise ValueError(f"'old' was not found in {path}; copy it exactly from a read result.{hint}")
         return self.edit_file(path, text.replace(old, new, 1))
 
     def _resolve(self, path: str, *, allow_missing: bool = False) -> Path:
