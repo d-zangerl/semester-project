@@ -40,6 +40,69 @@ class PassingChecks:
 
 
 class ModelTaskLoopTests(unittest.TestCase):
+    def test_task_progress_is_appended_to_unique_root_log_as_events_happen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            log_root = root / "harness"
+            model = ScriptedModelClient([
+                json.dumps({"type": "tool", "tool": "edit", "arguments": {
+                    "path": "note.txt", "content": "updated",
+                }}),
+                json.dumps({"type": "final", "response": "Updated the note."}),
+                json.dumps({"type": "final", "response": "Second task complete."}),
+            ])
+            visible_during_progress = []
+
+            def observe_progress(message):
+                if message.startswith("Tool action"):
+                    logs = list(log_root.glob("coding-harness-task-*.log"))
+                    self.assertEqual(len(logs), 1)
+                    visible_during_progress.append(logs[0].read_text(encoding="utf-8"))
+                    self.assertIn(message, visible_during_progress[-1])
+                if message == "Requesting model response (2/40)":
+                    log_text = next(log_root.glob("coding-harness-task-*.log")).read_text(encoding="utf-8")
+                    self.assertIn("Tool result for edit", log_text)
+
+            controller = AgentController(
+                model,
+                RepositoryTools(workspace),
+                Verification(PassingChecks()),
+                progress=observe_progress,
+                task_log_directory=log_root,
+            )
+            result = controller.run_task("Update the note", workspace)
+
+            logs = list(log_root.glob("coding-harness-task-*.log"))
+            self.assertEqual(len(logs), 1)
+            self.assertTrue(visible_during_progress)
+            contents = logs[0].read_text(encoding="utf-8")
+            self.assertIn("Updated the note", contents)
+            self.assertIn("Tool result", contents)
+            self.assertIn("core", contents)
+            self.assertIn("actions=1", contents)
+            self.assertTrue(result.verification_passed)
+            controller.run_task("Second independent task", workspace)
+            self.assertEqual(len(list(log_root.glob("coding-harness-task-*.log"))), 2)
+            self.assertEqual(logs[0].read_text(encoding="utf-8"), contents)
+
+    def test_model_request_instructs_testing_when_behavior_is_testable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = ScriptedModelClient([
+                json.dumps({"type": "final", "response": "No code changes needed."}),
+            ])
+
+            AgentController(
+                model, RepositoryTools(directory), Verification(PassingChecks()),
+                task_log_directory=directory,
+            ).run_task("Review this repository", directory)
+
+            system_prompt = model.requests[0][0]["content"]
+            self.assertIn("relevant regression tests", system_prompt)
+            self.assertIn("requested behavior is testable", system_prompt)
+            self.assertIn("testing is not applicable", system_prompt)
+
     def test_edit_result_returns_to_model_and_final_response_runs_verification(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)

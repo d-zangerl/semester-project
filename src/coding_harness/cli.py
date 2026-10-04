@@ -65,6 +65,7 @@ class UserInterface:
                     RepositoryTools(workspace),
                     Verification(environment),
                     progress=lambda message: print(f"[progress] {message}"),
+                    task_log_directory=project_root,
                 )
                 result = controller.run_task(task, workspace)
             except KeyboardInterrupt:

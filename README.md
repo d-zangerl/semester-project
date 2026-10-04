@@ -20,7 +20,7 @@ python3 src/main.py --repository ./target-repository
 
 No harness package installation is needed. The default configured check is `python3 tests/test_core.py`, run only inside the macOS `sandbox-exec` sandbox. On a platform without the supported sandbox, or if its boundary probe fails, verification is reported unavailable and repository code is not run.
 
-At the `Task>` prompt, enter a task, `/help`, or `/quit`. Multiple tasks can be submitted in one process; each task receives a fresh file copy and an empty model conversation. Review the printed diff and check results. Task workspaces are retained at the shown path for inspection; this delivery does not apply changes to the configured repository and has no approval/apply workflow.
+At the `Task>` prompt, enter a task, `/help`, or `/quit`. Multiple tasks can be submitted in one process; each task receives a fresh file copy and an empty model conversation. Review the printed diff and check results. Each task also creates a separate root-level `coding-harness-task-<unique-id>.log`, reports its path when it starts, and appends timestamped progress, model steps, tool actions/results, verification output, counters, and failures as they happen. The log remains available after the task and is ignored by Git. Logs can contain task text, model/tool output, repository snippets, and check output; keep them private and remove them when no longer needed. Task workspaces are retained at the shown path for inspection; this delivery does not apply changes to the configured repository and has no approval/apply workflow.
 
 ## Collaborators and flow
 
@@ -36,7 +36,7 @@ flowchart LR
   V --> UI
 ```
 
-For each task, the controller sends the request and a filtered file listing, validates each exact JSON response, dispatches only permitted repository tools, and returns tool results to the model. A final response invokes `Verification`; only actual configured check results determine whether verification passed.
+For each task, the controller sends the request, a filtered file listing, and instructions to inspect existing tests and add or update relevant regression tests whenever the requested behavior is testable. Documentation-only work and other non-testable tasks need not edit a test file; the model should explain when testing is not applicable. The controller validates each exact JSON response, dispatches only permitted repository tools, and returns tool results to the model. A final response invokes `Verification`; only actual configured check results determine whether verification passed.
 
 ## Safety and limits
 
