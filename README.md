@@ -1,62 +1,160 @@
 # Coding Harness
 
-A small Python CLI that uses a local Ollama model to inspect and edit a disposable copy of a configured repository. Every task has a new workspace and model context. The model can use only the contained `list`, `read`, `search`, and `edit` repository tools; it cannot run arbitrary commands. After the model finishes, the harness runs the configured repository checks in the OS-enforced sandbox and shows the changed files, bounded diff, check output, and exit codes. A model's final response never overrides failed or unavailable checks.
+A small Python CLI that uses a **local Ollama model** to inspect and edit a **disposable copy** of a configured repository. You chat with it task by task; after each task you review the diff and either `/approve` it (apply to the repository) or `/reject` it.
 
-## Run
+The model can only use four bounded tools (`list`, `read`, `search`, `edit`). It cannot run commands. After it finishes, the harness itself runs the repository's configured check inside an OS-enforced sandbox. The model's claim of success never overrides a failed or unavailable check.
 
-Use Python 3 and start from the project root:
+## Prerequisites
 
-```bash
-python3 src/main.py
-```
+| Need | Details |
+|---|---|
+| Python | 3.10 or newer (tested with 3.14). Standard library only; nothing to install. |
+| Sandbox | macOS with `/usr/bin/sandbox-exec`. On any other platform repository checks are reported **unavailable** and no repository code runs. |
+| Model | [Ollama](https://ollama.com) running locally with a pulled model, e.g. `ollama pull qwen2.5-coder:7b`. Only loopback endpoints are accepted. |
+| Target | A local repository. The default is `./target-repository` (OpenStock). Its core check needs the git-ignored `target-repository/data/openstock.db`; the harness does not create it (the legacy `import_access.py` importer is Windows-only). |
 
-The default target is `./target-repository`. Select another local checkout with `--repository /path/to/repository` or set `CODING_HARNESS_REPOSITORY`. Ollama must already be running locally and the chosen model must be available; configure it with:
+## Configuration (no secrets needed)
+
+All settings are optional. Example (copy into your shell; there are no keys or tokens):
 
 ```bash
 export CODING_HARNESS_OLLAMA_ENDPOINT=http://localhost:11434
 export CODING_HARNESS_OLLAMA_MODEL=qwen2.5-coder:7b
-python3 src/main.py --repository ./target-repository
+export CODING_HARNESS_REPOSITORY=./target-repository
 ```
 
-No harness package installation is needed. The default configured check is `python3 tests/test_core.py`, run only inside the macOS `sandbox-exec` sandbox. On a platform without the supported sandbox, or if its boundary probe fails, verification is reported unavailable and repository code is not run.
+## Run
 
-At the `Task>` prompt, enter a task, `/help`, or `/quit`. Multiple tasks can be submitted in one process; each task receives a fresh file copy and an empty model conversation. Review the printed diff and check results. Each task also creates a separate root-level `coding-harness-task-<unique-id>.log`, reports its path when it starts, and appends timestamped progress, model steps, tool actions/results, verification output, counters, and failures as they happen, and ends with the final unified diff of the task (as readable text, size-bounded like the printed diff). The log remains available after the task and is ignored by Git. Logs can contain task text, model/tool output, repository snippets, and check output; keep them private and remove them when no longer needed.
+From the project root:
 
-### Reviewing and applying a result
+```bash
+python3 src/main.py
+python3 src/main.py --repository /path/to/other/repository   # override the target
+python3 src/main.py --help
+```
 
-When a task changes files, a `Review>` prompt follows the diff and check results:
+Run the harness tests (no Ollama needed; they use scripted models):
 
-- `/diff` shows the diff and check results again; nothing is applied until you decide.
-- `/reject` leaves the configured repository unchanged and removes the task workspace if its checks passed (otherwise it is kept and its path printed).
-- `/approve` copies every changed file into the configured repository. If the repository changed since the task started, a `WARNING` lists the differing files first and the task's files are still force-applied over them. The core check then runs in the sandbox on a fresh copy of the updated repository (never directly in it); its output and exit code are printed. On success both workspaces are removed. On a failed, timed-out, or unavailable check the workspaces are retained and their paths printed. The harness exits non-zero if any task or post-apply check did not pass.
-- Ending input (Ctrl-D) during review applies nothing and keeps the workspace.
+```bash
+python3 -m unittest discover -s tests -v
+```
 
-The harness has no tool to delete files, so applied changes are file creations and edits.
+## Using it
 
-## Collaborators and flow
+At the `Task>` prompt:
+
+| Input | Effect |
+|---|---|
+| any text | Starts a new task: fresh workspace copy and fresh model conversation (nothing carries over from earlier tasks). One task runs at a time. |
+| `/help` | Shows the controls. |
+| `/quit` | Exits. |
+
+While a task runs you see `[progress]` lines for each model request and tool action. Each task also writes `coding-harness-task-<id>.log` in the project root (git-ignored): timestamped steps, tool results, rejected raw model replies, check output, counters and, at the end, the final diff. Logs can contain task text, repository snippets and check output; keep them private.
+
+When the model finishes you see the final response, counters, changed files, a bounded diff and the check results (exit code, output, `PASS`/`FAIL`/`TIMED OUT`/`UNAVAILABLE`).
+
+If files changed, a `Review>` prompt follows:
+
+| Input | Effect |
+|---|---|
+| `/diff` | Shows the diff and check results again. Nothing is applied yet. |
+| `/reject` | Target unchanged. The workspace is removed if its checks passed, otherwise kept and its path printed. |
+| `/approve` | Copies every changed file into the target (see below). |
+
+`/approve` details:
+1. If the target changed since the task started, a `WARNING` lists the differing files. Approval still **force-applies** the task's files over them.
+2. The core check then runs in the sandbox on a **fresh copy of the updated target** (repository code is never run directly in the target). Output and exit code are printed.
+3. On success both workspaces are removed. On a failed, timed-out or unavailable check they are kept and their paths printed.
+
+Ctrl-D during review applies nothing and keeps the workspace. The process exits non-zero if any task or post-apply check did not pass. The harness has no delete tool, so approved changes are creations and edits.
+
+## Components
+
+| Component | File | Responsibility |
+|---|---|---|
+| `UserInterface` | `src/coding_harness/cli.py` | Prompts, progress, result display, review (`/approve`, `/reject`, `/diff`). |
+| `AgentController` | `agent.py` | Runs the model-tool loop, validates every reply, enforces limits, writes the task log. |
+| `ModelClient` | `model.py` | Non-streaming Ollama chat call; constrains replies to the action JSON schema. |
+| `RepositoryTools` | `repository.py` | `list`/`read`/`search`/`edit`, confined to the task workspace. |
+| `ExecutionEnvironment` | `execution.py` | Runs fixed checks in the macOS sandbox with timeout and bounded output; fails closed. |
+| `Verification` | `verification.py` | Captures the starting state, builds the diff, runs configured checks. |
+
+Small helpers, kept outside the six collaborators because they have no state or policy of their own: `workspace.py` (copy the repository for a task) and `review.py` (detect target changes and copy approved files). `main.py` is only the entry point.
 
 ```mermaid
 flowchart LR
-  UI[UserInterface] --> AC[AgentController]
-  AC --> MC[ModelClient / local Ollama]
-  AC --> RT[RepositoryTools]
-  AC --> V[Verification]
-  V --> EE[ExecutionEnvironment]
-  RT --> W[Disposable task workspace]
-  EE --> W
-  V --> UI
+  User((User)) --> UI[UserInterface]
+  UI -->|task| AC[AgentController]
+  AC -->|messages| MC[ModelClient]
+  MC -->|HTTP, loopback only| OL[(Ollama)]
+  AC -->|validated tool call| RT[RepositoryTools]
+  RT --> W[(Task workspace copy)]
+  AC -->|on final response| V[Verification]
+  V -->|fixed check name| EE[ExecutionEnvironment]
+  EE -->|sandbox-exec| W
+  V -->|diff and check results| UI
+  UI -->|/approve| T[(Target repository)]
+  UI -->|fresh copy + core check| V
 ```
 
-For each task, the controller sends the request, a filtered file listing, and instructions to inspect existing tests and add or update relevant regression tests whenever the requested behavior is testable. Documentation-only work and other non-testable tasks need not edit a test file; the model should explain when testing is not applicable. The controller validates each exact JSON response, dispatches only permitted repository tools, and returns tool results to the model. A final response invokes `Verification`; only actual configured check results determine whether verification passed.
+Model-tool loop for one task:
+
+```mermaid
+sequenceDiagram
+  participant AC as AgentController
+  participant M as ModelClient
+  participant RT as RepositoryTools
+  participant V as Verification
+  participant EE as ExecutionEnvironment
+  AC->>M: task + file listing + rules
+  loop until final reply or a limit is reached
+    M-->>AC: one JSON object
+    alt valid tool request
+      AC->>RT: list / read / search / edit
+      RT-->>AC: result or error
+      AC->>M: tool result
+    else invalid or unknown
+      AC->>M: error and expected JSON shape (nothing executed)
+    else final response
+      AC->>V: verify workspace
+      V->>EE: run configured check
+      EE-->>V: exit code, bounded output, or blocked
+      V-->>AC: diff + check results
+    end
+  end
+```
+
+Review and apply:
+
+```mermaid
+flowchart TD
+  A[Task finished with changes] --> B{Review prompt}
+  B -->|/diff| B
+  B -->|/reject| R{Task checks passed?}
+  R -->|yes| R1[Remove workspace]
+  R -->|no| R2[Keep workspace, print path]
+  B -->|/approve| C[Warn if target changed since start]
+  C --> D[Copy changed files into target]
+  D --> E[Fresh copy of target + sandboxed core check]
+  E -->|pass| F[Remove workspaces]
+  E -->|fail / timeout / unavailable| G[Keep workspaces, print paths]
+```
 
 ## Safety and limits
 
-- The configured repository is copied for a task and is never a tool or check working directory. The harness does not write back to it.
-- File tools resolve paths under the task workspace, reject escapes (including outside symlinks), limit file reads, omit secret-like/generated/binary files, and restrict edits to text files.
-- Model output must be exactly one JSON object with either a tool request or final response. Extra fields, duplicate keys, prose, malformed JSON, unknown tools, and invalid arguments are denied without executing a tool.
-- Repository checks come from the harness configuration; model-provided commands are never accepted. Repository commands run with the ticket 01 macOS sandbox, no network, a 60-second command timeout, and at most 64 KiB from each output stream.
-- The controller allows at most 30 successful tool actions, 3 invalid-action retries, 40 model responses, 64 KiB per model response, and 64 KiB per returned tool result. The CLI displays action, denied-action, retry, and response counters.
-- Verification reports unavailable checks as failures to verify, preserves nonzero exit codes and output, and limits the displayed diff to 64 KiB.
-- The sandbox is an OS boundary, not a guarantee against every possible vulnerability in the host runtime. Do not treat the harness as a production multi-user security boundary.
+**The disposable copy is not the sandbox.** It only keeps edits away from the target until you approve. Isolation of repository code comes from the OS sandbox:
 
-The configured OpenStock core test requires the local, git-ignored `target-repository/data/openstock.db`; it is not included in the source checkout. If unavailable, the harness retains and reports its nonzero check result instead of claiming success. The legacy Windows-only `import_access.py` importer is not run automatically.
+- Containment boundary (macOS `sandbox-exec`, default deny): repository code may write only inside its task workspace, read only the workspace and the Python runtime, and has no network. Child processes cannot leave the process group, which is killed on timeout and on completion.
+- **Fail closed:** before each check a probe verifies workspace writes work and host writes/reads and network are blocked. If the sandbox is missing, unsupported or the probe fails, the result is `UNAVAILABLE` and no repository code runs. There is no plain-subprocess fallback.
+- Limits: 30 tool actions, 3 invalid-reply retries, 40 model responses, 64 KiB per model reply and per tool result, 256 KiB per file read/edit, 60 s per check, 64 KiB per check output stream, 64 KiB displayed diff. Reaching a limit stops the task and the counters are shown.
+- Model replies must be exactly one JSON object (a single markdown fence is tolerated). Extra fields, duplicate keys, prose, unknown tools and bad arguments are denied without executing anything.
+- File tools reject paths outside the workspace (including symlinks), omit secret-like, generated and binary files, and only edit text files.
+- Disabled: arbitrary shell commands, model-chosen commands, network access, Git mutation, package installation, push, merge and deployment. Only the fixed configured check can execute.
+- The sandbox is an OS boundary, not a guarantee against every host-runtime vulnerability; this is not a production multi-user security boundary.
+
+## Verification
+
+- **Configured repository check** (`python3 tests/test_core.py`): the repository's own regression tests. Passing means existing behavior still works. It does not prove the requested task was done correctly.
+- **Task-specific acceptance evidence** is separate: a check for the requested behavior that lives outside the task workspace and is run against the result. The harness does not run one automatically; the model may add tests to the workspace, but those are only evidence if you review them.
+- Failures are never hidden: a nonzero exit shows `FAIL (exit code N)` with its output, a timeout shows `TIMED OUT`, and a missing or failed sandbox shows `UNAVAILABLE: <reason>`. The model's final message is printed but labelled non-authoritative when verification did not pass.
+- Small local models may claim an edit they did not make. The harness shows the real result (`Changed files: (none)`).
