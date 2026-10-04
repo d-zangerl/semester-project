@@ -101,7 +101,6 @@ class AgentController:
         premature_final_denied = False
         no_change_denied = False
         edited = False
-        edited = False
         while counters.responses < self.limits.responses:
             self._emit_progress(f"Requesting model response ({counters.responses + 1}/{self.limits.responses})")
             try:
@@ -186,7 +185,6 @@ class AgentController:
                     tool_name, arguments = action["tool"], action["arguments"]
                     try:
                         result = self._execute(tool_name, arguments)
-                        edited = edited or tool_name == "edit"
                         edited = edited or tool_name == "edit"
                         counters.actions += 1
                         self._emit_progress(f"Tool action {counters.actions}/{self.limits.actions}: {tool_name}")
