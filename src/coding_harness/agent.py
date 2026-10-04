@@ -187,6 +187,11 @@ class AgentController:
             self._log_event(f"Configured verification passed: {verification.passed}")
         else:
             self._log_event("Task ended without configured verification results.")
+        if verification is not None:
+            changed = ", ".join(verification.changed_files) or "none"
+            self._log_event(f"Task diff (changed files: {changed}; truncated={verification.diff_truncated}):")
+            self._task_log.write((verification.diff or "(no textual diff)").rstrip("\n") + "\n")
+            self._task_log.flush()
         self._task_log.close()
         self._task_log = None
         return TaskResult(final, verification, counters, stopped)
