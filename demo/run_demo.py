@@ -26,15 +26,31 @@ from coding_harness.verification import Verification  # noqa: E402
 from coding_harness.workspace import create_task_workspace  # noqa: E402
 
 TARGET = ROOT / "target-repository"
-ACCEPTANCE = Path(__file__).resolve().parent / "accept_quote.py"
-TASK = "In quotes.py, make create_quote raise ValueError(\"Quote line quantity must be positive.\") when a line has a quantity of zero or less."
-EXPECTED = ("A quote line with qty <= 0 raises ValueError and nothing is stored; "
-            "positive quotes keep working; existing core tests still pass.")
-SCOPE = ("quotes.py (required); files under tests/ (optional). "
-         "No other files, no database or config changes.")
-ALLOWED = ("quotes.py",)
+DEMOS = {
+    "quote": {
+        "acceptance": "accept_quote.py",
+        "task": "In quotes.py, make create_quote raise ValueError(\"Quote line quantity must be positive.\") when a line has a quantity of zero or less.",
+        "expected": ("A quote line with qty <= 0 raises ValueError and nothing is stored; "
+                     "positive quotes keep working; existing core tests still pass."),
+        "scope": "quotes.py (required); files under tests/ (optional). No other files, no database or config changes.",
+        "allowed": ("quotes.py",),
+    },
+    "transfer": {
+        "acceptance": "accept_transfer.py",
+        "task": ("In operations.py, inside _transfer, raise OperationError(\"Quantity must be positive.\") "
+                 "right after the line qty = float(e[\"qty\"]) when qty is zero or less."),
+        "expected": ("A transfer line with qty <= 0 raises OperationError and changes nothing; "
+                     "positive transfers keep working; existing core tests still pass."),
+        "scope": ("operations.py (required); app.py and files under tests/ (optional). "
+                  "No other files, no database or config changes."),
+        "allowed": ("operations.py", "app.py"),
+    },
+}
+DEMO = DEMOS[sys.argv[1] if len(sys.argv) > 1 else "quote"]
+ACCEPTANCE = Path(__file__).resolve().parent / DEMO["acceptance"]
+TASK, EXPECTED, SCOPE, ALLOWED = DEMO["task"], DEMO["expected"], DEMO["scope"], DEMO["allowed"]
 ALLOWED_PREFIX = ("tests/",)
-ACCEPTANCE_DEST = ".harness-acceptance/accept_quote.py"
+ACCEPTANCE_DEST = ".harness-acceptance/" + DEMO["acceptance"]
 
 
 def run_in_fresh_copy(environment: ExecutionEnvironment, repository: Path, check_name: str, with_acceptance: bool):
@@ -99,7 +115,7 @@ def main() -> int:
         "- Task: " + TASK,
         "- Expected behavior: " + EXPECTED,
         "- Permitted scope: " + SCOPE,
-        "- Acceptance check: `demo/accept_quote.py` (outside the workspace; copied in only for each run)",
+        "- Acceptance check: `demo/" + DEMO["acceptance"] + "` (outside the workspace; copied in only for each run)",
         "- Baseline acceptance (before model): " + status(baseline),
         "- Final acceptance (after model): " + status(final_acceptance),
         "- Configured regression check (core): " + status(final_core),
