@@ -120,6 +120,25 @@ class RepositoryTools:
             raise ValueError(f"'old' was not found in {path}; copy it exactly from a read result.{hint}")
         return self.edit_file(path, text.replace(old, new, 1))
 
+    def insert_after_line(self, path: str, after_line: int, text: str) -> dict:
+        file = self._resolve(path)
+        if self._excluded(file) or not file.is_file():
+            raise ValueError("Edit path must identify an allowed file.")
+        if isinstance(after_line, bool) or not isinstance(after_line, int) or not isinstance(text, str) or not text.strip():
+            raise ValueError("Insert needs an integer 'after_line' and non-empty text.")
+        lines = self.read_file(path)["content"].splitlines(keepends=True)
+        if not 0 <= after_line <= len(lines):
+            raise ValueError(f"'after_line' must be between 0 and {len(lines)}; {path} only has {len(lines)} lines.")
+        block = text.rstrip("\n").splitlines()
+        if after_line and block[0] == block[0].lstrip():
+            anchor = lines[after_line - 1]
+            indent = anchor[:len(anchor) - len(anchor.lstrip())]
+            block = [indent + line if line.strip() else line for line in block]
+        if lines and after_line and not lines[after_line - 1].endswith("\n"):
+            lines[after_line - 1] += "\n"
+        lines[after_line:after_line] = [line + "\n" for line in block]
+        return self.edit_file(path, "".join(lines))
+
     def _resolve(self, path: str, *, allow_missing: bool = False) -> Path:
         if not isinstance(path, str) or not path or "\x00" in path:
             raise ValueError("Path must be a non-empty workspace-relative path.")

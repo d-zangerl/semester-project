@@ -242,7 +242,7 @@ class AgentController:
             '{"type":"tool","tool":"read","arguments":{"path":"relative/path"}} or '
             '{"type":"final","response":"<one sentence describing what you actually changed>"}. Send a final response only after your edit tool call succeeded (unless no change is needed). Tool argument schemas: list {"path":"."} (optional path), '
             'read {"path":"...","start":1,"end":200} (optional 1-based inclusive line range; at most 200 lines are returned per read, the result tells you the total line count), search {"query":"...","path":"."} (optional path), edit {"path":"...","content":"..."} to write a whole (small or new) file, or edit {"path":"...","old":"exact existing snippet","new":"replacement"} to change one snippet that occurs exactly once (preferred for existing or large files). '
-            "Start by listing the repository root with the list tool; only read paths that the list or search results showed. For large files use search to find the line number you need, then read a small line range around it, then change it with edit old/new. Create new files with the edit tool (it creates missing files). Never give up after a denied action: correct it and continue. Inspect the repository's existing tests. If the requested behavior is testable, add or update relevant "
+            "Start by listing the repository root with the list tool; only read paths that the list or search results showed. For large files use search to find the line number you need, then read a small line range around it, then change it with edit after_line/text (add code) or old/new (change a line). Create new files with the edit tool (it creates missing files). Never give up after a denied action: correct it and continue. Inspect the repository's existing tests. If the requested behavior is testable, add or update relevant "
             "regression tests with the edit tool; configured checks run automatically after your final response. Do not force a test-file change for tasks "
             "such as documentation-only work; if testing is not applicable, state why in your final response. "
             "Reply with raw JSON only: no markdown code fences and no prose outside the JSON object. A final response is not proof that checks passed."
@@ -278,7 +278,7 @@ class AgentController:
         if not isinstance(name, str):
             raise ValueError("Tool name must be text.")
         schemas = {"list": (set(), {"path"}), "read": ({"path"}, {"path", "start", "end"}),
-                   "search": ({"query"}, {"query", "path"}), "edit": ({"path"}, {"path", "content", "old", "new"})}
+                   "search": ({"query"}, {"query", "path"}), "edit": ({"path"}, {"path", "content", "old", "new", "after_line", "text"})}
         if name not in schemas:
             raise ValueError(f"Unknown tool: {name!r}")
         required, allowed = schemas[name]
@@ -296,11 +296,15 @@ class AgentController:
         if name == "search" and (not isinstance(args["query"], str) or not isinstance(args.get("path", "."), str)):
             raise ValueError("Search arguments must be text.")
         if name == "edit":
-            whole_file, replacement = "content" in args, "old" in args or "new" in args
-            if whole_file == replacement or (replacement and not {"old", "new"} <= args.keys()):
-                raise ValueError("Edit needs either 'content' (whole file) or both 'old' and 'new' (one exact snippet).")
-            if not all(isinstance(value, str) for value in args.values()):
+            whole_file, replacement, insertion = "content" in args, "old" in args or "new" in args, "after_line" in args or "text" in args
+            if whole_file + replacement + insertion != 1 or (replacement and not {"old", "new"} <= args.keys()) \
+                    or (insertion and not {"after_line", "text"} <= args.keys()):
+                raise ValueError("Edit needs exactly one mode: 'content' (whole file), both 'old' and 'new' (one exact snippet), "
+                                 "or both 'after_line' (integer) and 'text' (lines to insert after that line number).")
+            if not all(isinstance(value, str) for key, value in args.items() if key != "after_line"):
                 raise ValueError("Edit arguments must be text.")
+            if insertion and (isinstance(args["after_line"], bool) or not isinstance(args["after_line"], int)):
+                raise ValueError("'after_line' must be an integer.")
         return value
 
     def _execute(self, name: str, args: dict):
@@ -313,5 +317,7 @@ class AgentController:
         if name == "edit":
             if "content" in args:
                 return self.repository_tools.edit_file(args["path"], args["content"])
+            if "after_line" in args:
+                return self.repository_tools.insert_after_line(args["path"], args["after_line"], args["text"])
             return self.repository_tools.replace_in_file(args["path"], args["old"], args["new"])
         raise ValueError(f"Unknown tool: {name!r}")

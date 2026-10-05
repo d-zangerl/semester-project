@@ -257,6 +257,33 @@ class ModelTaskLoopTests(unittest.TestCase):
             self.assertIn("'path'", feedback)
             self.assertIn("unexpected 'pattern'", feedback)
 
+    def test_edit_insert_adds_text_after_a_line_number_and_matches_its_indentation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            (workspace / "code.py").write_text("def f(x):\n    y = x\n    return y\n", encoding="utf-8")
+
+            def insert(**arguments):
+                return json.dumps({"type": "tool", "tool": "edit", "arguments": {"path": "code.py", **arguments}})
+
+            model = ScriptedModelClient([
+                insert(after_line=2, text="if y < 0:\n    raise ValueError('neg')"),
+                insert(after_line=99, text="z"),
+                insert(after_line=0, text="# top\n"),
+                insert(after_line=1, text="x", old="a", new="b"),
+                json.dumps({"type": "final", "response": "Done."}),
+            ])
+            controller = AgentController(
+                model, RepositoryTools(workspace), Verification(PassingChecks()),
+                task_log_directory=Path(directory) / "logs",
+            )
+            result = controller.run_task("Anything", workspace)
+            self.assertEqual(
+                (workspace / "code.py").read_text(encoding="utf-8"),
+                "# top\ndef f(x):\n    y = x\n    if y < 0:\n        raise ValueError('neg')\n    return y\n")
+            self.assertEqual(result.counters.denied_actions, 2)
+            self.assertIn("only has 5 lines", model.requests[2][-1]["content"])
+
     def test_edit_replace_changes_one_exact_snippet_and_rejects_ambiguous_or_missing_snippets(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / "workspace"

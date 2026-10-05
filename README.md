@@ -2,7 +2,7 @@
 
 A small Python CLI that uses a **local Ollama model** to inspect and edit a **disposable copy** of a configured repository. You chat with it task by task; after each task you review the diff and either `/approve` it (apply to the repository) or `/reject` it.
 
-The model can only use four bounded tools (`list`, `read`, `search`, `edit`). `read` returns at most 200 lines per call (use `start`/`end` for a line range; the result reports the total line count), and `edit` either writes a whole file or replaces one exact snippet (`old`/`new`) that must occur exactly once, with the denial naming the matching lines. A final reply before any tool call is denied once. It cannot run commands. After it finishes, the harness itself runs the repository's configured check inside an OS-enforced sandbox. The model's claim of success never overrides a failed or unavailable check.
+The model can only use four bounded tools (`list`, `read`, `search`, `edit`). `read` returns at most 200 lines per call (use `start`/`end` for a line range; the result reports the total line count), and `edit` has three modes: write a whole file (`content`), replace one exact snippet that must occur exactly once (`old`/`new`; the denial names matching lines), or insert lines after a line number (`after_line`/`text`; indentation of that line is copied when the text has none). A final reply before any tool call is denied once. It cannot run commands. After it finishes, the harness itself runs the repository's configured check inside an OS-enforced sandbox. The model's claim of success never overrides a failed or unavailable check.
 
 ## Prerequisites
 

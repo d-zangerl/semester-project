@@ -16,6 +16,7 @@ ACTION_SCHEMA = {
             "path": {"type": "string"}, "query": {"type": "string"}, "content": {"type": "string"},
             "old": {"type": "string"}, "new": {"type": "string"},
             "start": {"type": "integer"}, "end": {"type": "integer"},
+            "after_line": {"type": "integer"}, "text": {"type": "string"},
         }},
         "response": {"type": "string"},
     },
