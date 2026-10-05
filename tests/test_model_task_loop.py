@@ -244,18 +244,21 @@ class ModelTaskLoopTests(unittest.TestCase):
             workspace.mkdir()
             model = ScriptedModelClient([
                 LIST,
-                json.dumps({"type": "tool", "tool": "search", "arguments": {"pattern": "x"}}),
+                json.dumps({"type": "tool", "tool": "search", "arguments": {
+                    "query": "delete_quote", "start": 1, "end": 500, "after_line": 2, "text": "hint",
+                }}),
                 json.dumps({"type": "final", "response": "Stopping."}),
             ])
             controller = AgentController(
                 model, RepositoryTools(workspace), Verification(PassingChecks()),
                 task_log_directory=Path(directory) / "logs",
             )
-            controller.run_task("Anything", workspace)
+            result = controller.run_task("Anything", workspace)
             feedback = model.requests[2][-1]["content"]
             self.assertIn("requires 'query'", feedback)
             self.assertIn("'path'", feedback)
-            self.assertIn("unexpected 'pattern'", feedback)
+            self.assertIn("unexpected 'after_line', 'end', 'start', 'text'", feedback)
+            self.assertEqual(result.counters.denied_actions, 1)
 
     def test_edit_insert_adds_text_after_a_line_number_and_matches_its_indentation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -284,6 +287,127 @@ class ModelTaskLoopTests(unittest.TestCase):
             self.assertEqual(result.counters.denied_actions, 2)
             self.assertIn("only has 5 lines", model.requests[2][-1]["content"])
 
+    def test_repository_tools_replace_a_bounded_inclusive_line_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            source = workspace / "route.py"
+            source.write_text(
+                "def route():\n    delete(no)\n    return success()\n",
+                encoding="utf-8",
+            )
+            tools = RepositoryTools(workspace)
+
+            tools.replace_lines(
+                "route.py",
+                start_line=2,
+                end_line=3,
+                text='    if not delete(no):\n        return missing(), 404\n    return success()',
+            )
+
+            self.assertEqual(
+                source.read_text(encoding="utf-8"),
+                "def route():\n    if not delete(no):\n        return missing(), 404\n    return success()\n",
+            )
+            with self.assertRaisesRegex(ValueError, "between 1 and 4"):
+                tools.replace_lines("route.py", start_line=0, end_line=1, text="invalid")
+
+            large = workspace / "large.py"
+            original = "".join(f"line_{number}\n" for number in range(1, 241))
+            large.write_text(original, encoding="utf-8")
+            tools.replace_lines("large.py", start_line=230, end_line=230, text="replacement")
+            self.assertIn("replacement\nline_231\n", large.read_text(encoding="utf-8"))
+
+    def test_edit_tool_accepts_line_range_replacement_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            source = workspace / "route.py"
+            source.write_text("def route():\n    delete(no)\n    return success()\n", encoding="utf-8")
+            replacement = json.dumps({
+                "type": "tool",
+                "tool": "edit",
+                "arguments": {
+                    "path": "route.py",
+                    "start_line": 2,
+                    "end_line": 3,
+                    "text": "    if not delete(no):\n        return missing(), 404\n    return success()",
+                },
+            })
+            model = ScriptedModelClient([
+                replacement,
+                json.dumps({"type": "final", "response": "Updated the route."}),
+            ])
+            controller = AgentController(
+                model, RepositoryTools(workspace), Verification(PassingChecks()),
+                task_log_directory=Path(directory) / "logs",
+            )
+
+            result = controller.run_task("Update the route", workspace)
+
+            self.assertEqual(result.counters.denied_actions, 0)
+            self.assertIn("if not delete(no)", source.read_text(encoding="utf-8"))
+
+    def test_repository_tools_replace_one_python_function_and_preserve_surrounding_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            source = workspace / "app.py"
+            source.write_text(
+                "@app.route('/api/quote/<path:no>', methods=['DELETE'])\n"
+                "def api_quote_delete(no):\n"
+                "    quotes.delete_quote(no)\n"
+                "    return jsonify({'ok': True})\n"
+                "\n"
+                "def following_route():\n"
+                "    return 'unchanged'\n",
+                encoding="utf-8",
+            )
+
+            RepositoryTools(workspace).replace_function(
+                "app.py",
+                "api_quote_delete",
+                "def api_quote_delete(no):\n"
+                "    if not quotes.delete_quote(no):\n"
+                "        return jsonify({'ok': False}), 404\n"
+                "    return jsonify({'ok': True})",
+            )
+
+            updated = source.read_text(encoding="utf-8")
+            self.assertIn("@app.route('/api/quote/<path:no>', methods=['DELETE'])\ndef api_quote_delete(no):", updated)
+            self.assertIn("        return jsonify({'ok': False}), 404\n", updated)
+            self.assertIn("def following_route():\n    return 'unchanged'\n", updated)
+            with self.assertRaisesRegex(ValueError, "top-level function named"):
+                RepositoryTools(workspace).replace_function("app.py", "missing", "def missing():\n    pass")
+
+    def test_edit_tool_replaces_a_python_function(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            source = workspace / "app.py"
+            source.write_text("@route\ndef remove(no):\n    return True\n", encoding="utf-8")
+            model = ScriptedModelClient([
+                json.dumps({
+                    "type": "tool",
+                    "tool": "edit",
+                    "arguments": {
+                        "path": "app.py",
+                        "function": "remove",
+                        "function_content": "def remove(no):\n    return False",
+                    },
+                }),
+                json.dumps({"type": "final", "response": "Updated remove."}),
+            ])
+            controller = AgentController(
+                model, RepositoryTools(workspace), Verification(PassingChecks()),
+                task_log_directory=Path(directory) / "logs",
+            )
+
+            result = controller.run_task("Update remove", workspace)
+
+            self.assertEqual(result.counters.denied_actions, 0)
+            self.assertEqual(source.read_text(encoding="utf-8"), "@route\ndef remove(no):\n    return False\n")
+
     def test_edit_replace_changes_one_exact_snippet_and_rejects_ambiguous_or_missing_snippets(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / "workspace"
@@ -305,13 +429,39 @@ class ModelTaskLoopTests(unittest.TestCase):
             )
             result = controller.run_task("Change code", workspace)
 
-            self.assertEqual((workspace / "code.py").read_text(encoding="utf-8"), "a = 9\nb = 2\nb = 2\n")
-            self.assertEqual(result.counters.actions, 1)
-            self.assertEqual(result.counters.denied_actions, 2)
-            self.assertIn("+a = 9", result.verification.diff)
+            self.assertEqual((workspace / "code.py").read_text(encoding="utf-8"), "y\nb = 2\nb = 2\n")
+            self.assertEqual(result.counters.actions, 2)
+            self.assertEqual(result.counters.denied_actions, 1)
+            self.assertIn("+y", result.verification.diff)
             feedback = [request[-1]["content"] for request in model.requests]
             self.assertIn("lines 2, 3", feedback[1])
-            self.assertIn("line 1", feedback[3])
+
+    def test_edit_replace_matches_unique_snippet_when_only_leading_indentation_differs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            source = workspace / "app.py"
+            source.write_text(
+                "def route():\n"
+                "        delete(no)\n"
+                "        return success()\n",
+                encoding="utf-8",
+            )
+            tools = RepositoryTools(workspace)
+
+            tools.replace_in_file(
+                "app.py",
+                "delete(no)\nreturn success()",
+                "if not delete(no):\n    return missing(), 404\nreturn success()",
+            )
+
+            self.assertEqual(
+                source.read_text(encoding="utf-8"),
+                "def route():\n"
+                "        if not delete(no):\n"
+                "            return missing(), 404\n"
+                "        return success()\n",
+            )
 
     def test_model_request_instructs_testing_when_behavior_is_testable(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -576,9 +726,22 @@ class OllamaContractTests(unittest.TestCase):
         self.assertEqual(seen["body"]["model"], "test-model")
         self.assertFalse(seen["body"]["stream"])
         action_schema = seen["body"]["format"]
-        self.assertEqual(action_schema["properties"]["type"]["enum"], ["tool", "final"])
-        self.assertEqual(action_schema["properties"]["tool"]["enum"], ["list", "read", "search", "edit"])
-        self.assertLessEqual({"old", "new"}, set(action_schema["properties"]["arguments"]["properties"]))
+        search_action = next(
+            branch for branch in action_schema["oneOf"]
+            if branch.get("properties", {}).get("tool", {}).get("const") == "search"
+        )
+        search_arguments = search_action["properties"]["arguments"]
+        self.assertEqual(set(search_arguments["properties"]), {"query", "path"})
+        self.assertTrue(search_arguments["additionalProperties"] is False)
+        edit_action = next(
+            branch for branch in action_schema["oneOf"]
+            if branch.get("properties", {}).get("tool", {}).get("const") == "edit"
+        )
+        edit_modes = edit_action["properties"]["arguments"]["oneOf"]
+        self.assertTrue(any(
+            {"function", "function_content"} <= set(mode["properties"])
+            for mode in edit_modes
+        ))
         self.assertEqual(seen["body"]["messages"], [{"role": "user", "content": "task"}])
 
     def test_model_client_rejects_nonlocal_endpoints(self):

@@ -35,6 +35,33 @@ DEMOS = {
         "scope": "quotes.py (required); files under tests/ (optional). No other files, no database or config changes.",
         "allowed": ("quotes.py",),
     },
+    "delete-quote": {
+        "acceptance": "accept_delete_quote.py",
+        "tasks": (
+            ("Edit only quotes.py. Use the edit old/new mode to replace the exact existing "
+             "`delete_quote(no)` function with this behavior: filter out quotes whose `no` matches; "
+             "return True and save only if the list became shorter; otherwise return False without saving. "
+             "Copy the old function exactly from the read result. Do not rewrite any other part of the file."),
+            ("Edit only app.py, inside the existing api_quote_delete(no) function for DELETE "
+             "`/api/quote/<path:no>`. Use function edit mode to replace only `api_quote_delete` with "
+             "exactly this function content, preserving its permission and error handling:\n"
+             "def api_quote_delete(no):\n"
+             "    _, err = _check(\"quotes\")\n"
+             "    if err:\n"
+             "        return err\n"
+             "    try:\n"
+             "        if not quotes.delete_quote(no):\n"
+             "            return jsonify({\"ok\": False, \"error\": \"Quote not found.\"}), 404\n"
+             "        return jsonify({\"ok\": True})\n"
+             "    except Exception as e:\n"
+             "        return jsonify({\"ok\": False, \"error\": str(e)}), 500\n"
+             "Do not include the route decorator in function_content; the tool preserves it."),
+        ),
+        "expected": ("Deleting an existing quote returns success and removes it; deleting a missing quote "
+                     "returns false from quotes.delete_quote() and the API returns HTTP 404 with ok=false."),
+        "scope": "quotes.py and app.py (required); files under tests/ (optional). No other files.",
+        "allowed": ("quotes.py", "app.py"),
+    },
     "transfer": {
         "acceptance": "accept_transfer.py",
         "task": ("In operations.py, inside _transfer, raise OperationError(\"Quantity must be positive.\") "
@@ -48,7 +75,8 @@ DEMOS = {
 }
 DEMO = DEMOS[sys.argv[1] if len(sys.argv) > 1 else "quote"]
 ACCEPTANCE = Path(__file__).resolve().parent / DEMO["acceptance"]
-TASK, EXPECTED, SCOPE, ALLOWED = DEMO["task"], DEMO["expected"], DEMO["scope"], DEMO["allowed"]
+TASKS = DEMO["tasks"] if "tasks" in DEMO else (DEMO["task"],)
+TASK, EXPECTED, SCOPE, ALLOWED = "\nTHEN\n".join(TASKS), DEMO["expected"], DEMO["scope"], DEMO["allowed"]
 ALLOWED_PREFIX = ("tests/",)
 ACCEPTANCE_DEST = ".harness-acceptance/" + DEMO["acceptance"]
 
@@ -85,7 +113,9 @@ def main() -> int:
                     ignore=shutil.ignore_patterns(".git", "venv", "__pycache__", "_test.db*", "_accept.db*"))
     print("Demo copy of the target (real target untouched): " + str(repository))
     print("Starting revision: " + revision)
-    print("Task to enter: " + TASK)
+    print("Task(s) to enter and approve in order:")
+    for index, task in enumerate(TASKS, 1):
+        print(f"{index}. {task}")
     print("Expected behavior: " + EXPECTED)
     print("Permitted scope: " + SCOPE + "\n")
 
@@ -125,7 +155,9 @@ def main() -> int:
     ]
     details = [
         "", "## Final acceptance output", "```", final_acceptance.stdout.rstrip(), "```",
+        "## Final acceptance errors", "```", final_acceptance.stderr.rstrip(), "```",
         "## Core check output", "```", final_core.stdout.rstrip(), "```",
+        "## Core check errors", "```", final_core.stderr.rstrip(), "```",
         "## Diff" + (" (truncated)" if truncated else ""), "```diff", diff.rstrip(), "```",
     ]
     record = ROOT / ("demo-record-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + ".md")

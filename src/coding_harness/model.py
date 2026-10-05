@@ -7,20 +7,80 @@ from urllib.parse import urlsplit
 from typing import Any
 
 
+def _tool_action_schema(name: str, arguments: dict) -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "type": {"const": "tool"},
+            "tool": {"const": name},
+            "arguments": arguments,
+        },
+        "required": ["type", "tool", "arguments"],
+        "additionalProperties": False,
+    }
+
+
+def _argument_schema(properties: dict, required: list[str]) -> dict:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": False,
+    }
+
+
 ACTION_SCHEMA = {
     "type": "object",
-    "properties": {
-        "type": {"type": "string", "enum": ["tool", "final"]},
-        "tool": {"type": "string", "enum": ["list", "read", "search", "edit"]},
-        "arguments": {"type": "object", "properties": {
-            "path": {"type": "string"}, "query": {"type": "string"}, "content": {"type": "string"},
-            "old": {"type": "string"}, "new": {"type": "string"},
-            "start": {"type": "integer"}, "end": {"type": "integer"},
-            "after_line": {"type": "integer"}, "text": {"type": "string"},
-        }},
-        "response": {"type": "string"},
-    },
-    "required": ["type"],
+    "oneOf": [
+        {
+            "type": "object",
+            "properties": {
+                "type": {"const": "final"},
+                "response": {"type": "string"},
+            },
+            "required": ["type", "response"],
+            "additionalProperties": False,
+        },
+        _tool_action_schema("list", _argument_schema({"path": {"type": "string"}}, [])),
+        _tool_action_schema("read", _argument_schema({
+            "path": {"type": "string"},
+            "start": {"type": "integer"},
+            "end": {"type": "integer"},
+        }, ["path"])),
+        _tool_action_schema("search", _argument_schema({
+            "query": {"type": "string"},
+            "path": {"type": "string"},
+        }, ["query"])),
+        _tool_action_schema("edit", {
+            "oneOf": [
+                _argument_schema({
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                }, ["path", "content"]),
+                _argument_schema({
+                    "path": {"type": "string"},
+                    "old": {"type": "string"},
+                    "new": {"type": "string"},
+                }, ["path", "old", "new"]),
+                _argument_schema({
+                    "path": {"type": "string"},
+                    "after_line": {"type": "integer"},
+                    "text": {"type": "string"},
+                }, ["path", "after_line", "text"]),
+                _argument_schema({
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer"},
+                    "end_line": {"type": "integer"},
+                    "text": {"type": "string"},
+                }, ["path", "start_line", "end_line", "text"]),
+                _argument_schema({
+                    "path": {"type": "string"},
+                    "function": {"type": "string"},
+                    "function_content": {"type": "string"},
+                }, ["path", "function", "function_content"]),
+            ],
+        }),
+    ],
 }
 
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import fnmatch
 import re
+import textwrap
 from pathlib import Path
 
 
@@ -114,6 +116,35 @@ class RepositoryTools:
             raise ValueError(f"'old' matches {found} times in {path} (lines {', '.join(numbers[:10])}); "
                              "include neighbouring lines so it matches exactly once.")
         if found == 0:
+            source_lines = text.splitlines(keepends=True)
+            old_lines = textwrap.dedent(old.strip("\r\n")).splitlines()
+            matching_starts = []
+            for start in range(len(source_lines) - len(old_lines) + 1):
+                candidate_text = "".join(source_lines[start:start + len(old_lines)]).rstrip("\r\n")
+                candidate = textwrap.dedent(candidate_text).splitlines()
+                if candidate == old_lines:
+                    matching_starts.append(start)
+            if len(matching_starts) == 1:
+                start = matching_starts[0]
+                end = start + len(old_lines)
+                segment = source_lines[start:end]
+                indent = segment[0][:len(segment[0]) - len(segment[0].lstrip())]
+                newline = "\r\n" if segment[-1].endswith("\r\n") else "\n"
+                replacement_lines = textwrap.dedent(new).splitlines()
+                ends_with_newline = segment[-1].endswith(("\n", "\r"))
+                replacement = [
+                    (indent + line if line else "") +
+                    (newline if index < len(replacement_lines) - 1 or ends_with_newline else "")
+                    for index, line in enumerate(replacement_lines)
+                ]
+                updated = source_lines[:start] + replacement + source_lines[end:]
+                return self.edit_file(path, "".join(updated))
+            if len(matching_starts) > 1:
+                numbers = [str(sum(line.count("\n") for line in source_lines[:start]) + 1)
+                           for start in matching_starts]
+                raise ValueError(
+                    f"'old' matches after ignoring leading whitespace in {path} "
+                    f"(lines {', '.join(numbers[:10])}); include more neighbouring text.")
             near = [str(number) for number, line in enumerate(text.splitlines(), 1)
                     if old.strip().splitlines() and old.strip().splitlines()[0].strip() == line.strip()]
             hint = f" A line with the same text but different whitespace is at line {', '.join(near[:10])}." if near else ""
@@ -126,7 +157,12 @@ class RepositoryTools:
             raise ValueError("Edit path must identify an allowed file.")
         if isinstance(after_line, bool) or not isinstance(after_line, int) or not isinstance(text, str) or not text.strip():
             raise ValueError("Insert needs an integer 'after_line' and non-empty text.")
-        lines = self.read_file(path)["content"].splitlines(keepends=True)
+        if file.stat().st_size > self.max_file_bytes:
+            raise ValueError(f"File exceeds the {self.max_file_bytes}-byte edit limit.")
+        try:
+            lines = file.read_text(encoding="utf-8").splitlines(keepends=True)
+        except UnicodeDecodeError as error:
+            raise ValueError("Binary files cannot be edited as text.") from error
         if not 0 <= after_line <= len(lines):
             raise ValueError(f"'after_line' must be between 0 and {len(lines)}; {path} only has {len(lines)} lines.")
         block = text.rstrip("\n").splitlines()
@@ -138,6 +174,75 @@ class RepositoryTools:
             lines[after_line - 1] += "\n"
         lines[after_line:after_line] = [line + "\n" for line in block]
         return self.edit_file(path, "".join(lines))
+
+    def replace_lines(self, path: str, start_line: int, end_line: int, text: str) -> dict:
+        file = self._resolve(path)
+        if self._excluded(file) or not file.is_file():
+            raise ValueError("Edit path must identify an allowed file.")
+        if (isinstance(start_line, bool) or not isinstance(start_line, int)
+                or isinstance(end_line, bool) or not isinstance(end_line, int)):
+            raise ValueError("'start_line' and 'end_line' must be integers.")
+        if not isinstance(text, str):
+            raise ValueError("Replacement text must be text.")
+        if file.stat().st_size > self.max_file_bytes:
+            raise ValueError(f"File exceeds the {self.max_file_bytes}-byte edit limit.")
+        try:
+            lines = file.read_text(encoding="utf-8").splitlines(keepends=True)
+        except UnicodeDecodeError as error:
+            raise ValueError("Binary files cannot be edited as text.") from error
+        total = len(lines)
+        if not 1 <= start_line <= end_line <= total:
+            raise ValueError(f"Line range must be between 1 and {total} with start_line <= end_line.")
+        replacement = text.splitlines(keepends=True)
+        if replacement and lines[end_line - 1].endswith(("\n", "\r")) and not text.endswith(("\n", "\r")):
+            replacement[-1] += "\n"
+        updated = lines[:start_line - 1] + replacement + lines[end_line:]
+        return self.edit_file(path, "".join(updated))
+
+    def replace_function(self, path: str, name: str, content: str) -> dict:
+        file = self._resolve(path)
+        if self._excluded(file) or not file.is_file() or file.suffix != ".py":
+            raise ValueError("Function replacement path must identify an allowed Python file.")
+        if not isinstance(name, str) or not name.isidentifier():
+            raise ValueError("Function name must be a Python identifier.")
+        if not isinstance(content, str) or len(content.encode("utf-8")) > self.max_file_bytes:
+            raise ValueError(f"Replacement function must be text no larger than {self.max_file_bytes} bytes.")
+        if file.stat().st_size > self.max_file_bytes:
+            raise ValueError(f"File exceeds the {self.max_file_bytes}-byte edit limit.")
+        try:
+            original = file.read_text(encoding="utf-8")
+            tree = ast.parse(original, filename=path)
+            replacement_tree = ast.parse(textwrap.dedent(content), filename=path)
+        except (UnicodeDecodeError, SyntaxError) as error:
+            raise ValueError(f"Python function replacement could not be parsed: {error}") from error
+        matches = [
+            node for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"Expected one top-level function named {name!r} in {path}; found {len(matches)}.")
+        if (len(replacement_tree.body) != 1
+                or not isinstance(replacement_tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef))
+                or replacement_tree.body[0].name != name
+                or replacement_tree.body[0].decorator_list):
+            raise ValueError(f"Replacement must contain only an undecorated function named {name!r}.")
+
+        target = matches[0]
+        lines = original.splitlines(keepends=True)
+        start = target.lineno - 1
+        end = target.end_lineno
+        indent = lines[start][:len(lines[start]) - len(lines[start].lstrip())]
+        newline = "\r\n" if lines[end - 1].endswith("\r\n") else "\n"
+        replacement_lines = textwrap.dedent(content.strip("\r\n")).splitlines()
+        ends_with_newline = lines[end - 1].endswith(("\n", "\r"))
+        replacement = [
+            (indent + line if line else "") +
+            (newline if index < len(replacement_lines) - 1 or ends_with_newline else "")
+            for index, line in enumerate(replacement_lines)
+        ]
+        updated = lines[:start] + replacement + lines[end:]
+        self.edit_file(path, "".join(updated))
+        return {"path": file.relative_to(self.workspace).as_posix(), "function": name}
 
     def _resolve(self, path: str, *, allow_missing: bool = False) -> Path:
         if not isinstance(path, str) or not path or "\x00" in path:

@@ -241,8 +241,8 @@ class AgentController:
             "Use only the list, read, search, and edit tools. Every response must be exactly one JSON object: "
             '{"type":"tool","tool":"read","arguments":{"path":"relative/path"}} or '
             '{"type":"final","response":"<one sentence describing what you actually changed>"}. Send a final response only after your edit tool call succeeded (unless no change is needed). Tool argument schemas: list {"path":"."} (optional path), '
-            'read {"path":"...","start":1,"end":200} (optional 1-based inclusive line range; at most 200 lines are returned per read, the result tells you the total line count), search {"query":"...","path":"."} (optional path), edit {"path":"...","content":"..."} to write a whole (small or new) file, or edit {"path":"...","old":"exact existing snippet","new":"replacement"} to change one snippet that occurs exactly once (preferred for existing or large files). '
-            "Start by listing the repository root with the list tool; only read paths that the list or search results showed. For large files use search to find the line number you need, then read a small line range around it, then change it with edit after_line/text (add code) or old/new (change a line). Create new files with the edit tool (it creates missing files). Never give up after a denied action: correct it and continue. Inspect the repository's existing tests. If the requested behavior is testable, add or update relevant "
+            'read {"path":"...","start":1,"end":200} (optional 1-based inclusive line range; at most 200 lines are returned per read, the result tells you the total line count), search {"query":"...","path":"."} (optional path), edit {"path":"...","content":"..."} to write a whole (small or new) file, edit {"path":"...","old":"exact existing snippet","new":"replacement"} to change one exact snippet, edit {"path":"...","after_line":123,"text":"new lines"} to insert after a line, edit {"path":"...","start_line":123,"end_line":124,"text":"replacement lines"} to replace an inclusive line range, or edit {"path":"...","function":"function_name","function_content":"def function_name(...):\\n    ..."} to replace one Python function while preserving its decorators. '
+            "Start by listing the repository root with the list tool; only read paths that the list or search results showed. For large files use search to find the line number you need, then read a small line range around it. Prefer line-range replacement when exact snippet matching is error-prone; use insertion to add code. Create new files with the edit tool (it creates missing files). Never give up after a denied action: correct it and continue. Inspect the repository's existing tests. If the requested behavior is testable, add or update relevant "
             "regression tests with the edit tool; configured checks run automatically after your final response. Do not force a test-file change for tasks "
             "such as documentation-only work; if testing is not applicable, state why in your final response. "
             "Reply with raw JSON only: no markdown code fences and no prose outside the JSON object. A final response is not proof that checks passed."
@@ -278,7 +278,9 @@ class AgentController:
         if not isinstance(name, str):
             raise ValueError("Tool name must be text.")
         schemas = {"list": (set(), {"path"}), "read": ({"path"}, {"path", "start", "end"}),
-                   "search": ({"query"}, {"query", "path"}), "edit": ({"path"}, {"path", "content", "old", "new", "after_line", "text"})}
+                   "search": ({"query"}, {"query", "path"}),
+                   "edit": ({"path"}, {"path", "content", "old", "new", "after_line", "start_line", "end_line",
+                                       "text", "function", "function_content"})}
         if name not in schemas:
             raise ValueError(f"Unknown tool: {name!r}")
         required, allowed = schemas[name]
@@ -296,15 +298,30 @@ class AgentController:
         if name == "search" and (not isinstance(args["query"], str) or not isinstance(args.get("path", "."), str)):
             raise ValueError("Search arguments must be text.")
         if name == "edit":
-            whole_file, replacement, insertion = "content" in args, "old" in args or "new" in args, "after_line" in args or "text" in args
-            if whole_file + replacement + insertion != 1 or (replacement and not {"old", "new"} <= args.keys()) \
-                    or (insertion and not {"after_line", "text"} <= args.keys()):
+            whole_file = "content" in args
+            replacement = "old" in args or "new" in args
+            insertion = "after_line" in args
+            line_replacement = "start_line" in args or "end_line" in args
+            function_replacement = "function" in args or "function_content" in args
+            if sum((whole_file, replacement, insertion, line_replacement, function_replacement)) != 1 \
+                    or (replacement and not {"old", "new"} <= args.keys()) \
+                    or (insertion and not {"after_line", "text"} <= args.keys()) \
+                    or (line_replacement and not {"start_line", "end_line", "text"} <= args.keys()) \
+                    or (function_replacement and not {"function", "function_content"} <= args.keys()):
                 raise ValueError("Edit needs exactly one mode: 'content' (whole file), both 'old' and 'new' (one exact snippet), "
-                                 "or both 'after_line' (integer) and 'text' (lines to insert after that line number).")
-            if not all(isinstance(value, str) for key, value in args.items() if key != "after_line"):
+                                 "both 'after_line' (integer) and 'text' (lines to insert), or "
+                                 "'start_line', 'end_line', and 'text' (inclusive line range replacement), or "
+                                 "'function' and 'function_content' (replace one Python function).")
+            if not all(isinstance(value, str) for key, value in args.items()
+                       if key not in {"after_line", "start_line", "end_line"}):
                 raise ValueError("Edit arguments must be text.")
             if insertion and (isinstance(args["after_line"], bool) or not isinstance(args["after_line"], int)):
                 raise ValueError("'after_line' must be an integer.")
+            if line_replacement and any(
+                isinstance(args[key], bool) or not isinstance(args[key], int)
+                for key in ("start_line", "end_line")
+            ):
+                raise ValueError("'start_line' and 'end_line' must be integers.")
         return value
 
     def _execute(self, name: str, args: dict):
@@ -319,5 +336,11 @@ class AgentController:
                 return self.repository_tools.edit_file(args["path"], args["content"])
             if "after_line" in args:
                 return self.repository_tools.insert_after_line(args["path"], args["after_line"], args["text"])
+            if "start_line" in args:
+                return self.repository_tools.replace_lines(
+                    args["path"], args["start_line"], args["end_line"], args["text"])
+            if "function" in args:
+                return self.repository_tools.replace_function(
+                    args["path"], args["function"], args["function_content"])
             return self.repository_tools.replace_in_file(args["path"], args["old"], args["new"])
         raise ValueError(f"Unknown tool: {name!r}")
