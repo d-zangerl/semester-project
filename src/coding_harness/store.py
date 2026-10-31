@@ -41,6 +41,7 @@ class TaskStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
 
     @contextmanager
@@ -48,7 +49,6 @@ class TaskStore:
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         try:
-            connection.execute("PRAGMA journal_mode=WAL")
             with connection:
                 yield connection
         finally:

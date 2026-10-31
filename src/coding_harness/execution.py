@@ -178,13 +178,13 @@ class DockerRunner:
                                 "--format", f'{{{{.ID}}}} {{{{.Label "{OWNER_LABEL}"}}}}').stdout
         for line in listing.splitlines():
             container, _, owner = line.partition(" ")
-            if owner.isdigit() and not _process_exists(int(owner)):
+            if owner.isdigit() and not process_exists(int(owner)):
                 self._control("rm", "-f", container)
                 removed.append(container)
         return removed
 
 
-def _process_exists(pid: int) -> bool:
+def process_exists(pid: int) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

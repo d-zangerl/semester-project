@@ -1,13 +1,17 @@
 import json
+import os
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
 from src.coding_harness.agent import RunLimits
 from src.coding_harness.context import CONTEXT_LIMIT_TOKENS, ContextLimits
 from src.coding_harness.core import TaskCore, UnknownProjectError
-from src.coding_harness.model import estimate_tokens
+from src.coding_harness.execution import CheckResult
+from src.coding_harness.model import ModelRejectedError, ModelUnavailableError, estimate_tokens
 from src.coding_harness.projects import Project
 from tests.fakes import LocalRunner
 
@@ -465,8 +469,7 @@ class ContextTests(ShapedRepositoryTestCase):
         self.assertIn(request, last[1]["content"])
         self.assertIn("quotes.py, app.py, note.txt", last[1]["content"])
         summary = next(m["content"] for m in last if "SUMMARY OF EARLIER STEPS" in m["content"])
-        self.assertIn("edit", summary)
-        self.assertIn("note.txt", summary)
+        self.assertIn("Files edited so far: note.txt", summary)
         self.assertEqual(len(model.requests), task.result.counters.responses)
 
     def test_untrusted_text_stays_labelled_and_out_of_the_trusted_messages(self):
@@ -488,6 +491,390 @@ class ContextTests(ShapedRepositoryTestCase):
     def test_a_request_too_large_for_the_trusted_budget_is_refused_rather_than_compressed(self):
         with self.assertRaises(ValueError):
             self.core(ScriptedModel()).start("demo", "x" * 40_000)
+
+
+class Crash(BaseException):
+    """Stands in for the process dying mid-action."""
+
+
+class CrashingRunner(LocalRunner):
+    def run(self, spec, timeout_seconds, output_limit_bytes):
+        if spec.purpose == "check" and self.crash:
+            self.crash = False
+            Path(spec.workspace, "note.txt").write_text("half written\n", encoding="utf-8")
+            raise Crash()
+        return super().run(spec, timeout_seconds, output_limit_bytes)
+
+    crash = True
+
+
+class BlockingRunner(LocalRunner):
+    """A check that hangs until the run's containers are removed."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.released = threading.Event()
+
+    def run(self, spec, timeout_seconds, output_limit_bytes):
+        if spec.purpose == "probe":
+            return super().run(spec, timeout_seconds, output_limit_bytes)
+        self.entered.set()
+        self.released.wait(10)
+        return CheckResult("", 137, "", "", False, False)
+
+    def remove_run(self, run_id):
+        super().remove_run(run_id)
+        self.released.set()
+
+
+class BlockingModel(ScriptedModel):
+    def __init__(self, *replies):
+        super().__init__(*replies)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.block_on = None
+
+    def request(self, messages):
+        if len(self.requests) == self.block_on:
+            self.entered.set()
+            self.release.wait(10)
+        return super().request(messages)
+
+
+class CancellationTests(CoreTestCase):
+    def start_in_background(self, core, results):
+        def run():
+            results.append(core.start("demo", "Work"))
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.addCleanup(thread.join)
+        return thread
+
+    def active_task(self, core):
+        for _ in range(200):
+            tasks = core.list_tasks()
+            if tasks:
+                return tasks[0].task_id
+            time.sleep(0.01)
+        self.fail("no task appeared")
+
+    def test_cancelling_during_a_model_request_returns_and_discards_the_late_reply(self):
+        model = BlockingModel(edit("note.txt", "late write\n"), final())
+        model.block_on = 0
+        results = []
+        thread = self.start_in_background(self.core(model), results)
+        self.assertTrue(model.entered.wait(5))
+
+        self.assertTrue(self.core().cancel(self.active_task(self.core())))
+        thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        task = results[0]
+        self.assertEqual(task.result.outcome, "cancelled")
+        model.release.set()
+        time.sleep(0.2)
+        self.assertEqual((task.workspace / "note.txt").read_text(encoding="utf-8"), "old\n")
+        self.assertEqual(self.core().show(task.task_id).state, "cancelled")
+
+    def test_cancelling_during_a_stuck_check_removes_its_containers_and_stops_further_actions(self):
+        self.runner = BlockingRunner()
+        model = ScriptedModel(tool("check", name="core"), edit("note.txt", "late write\n"), final())
+        results = []
+        thread = self.start_in_background(self.core(model), results)
+        self.assertTrue(self.runner.entered.wait(5))
+
+        self.core().cancel(self.active_task(self.core()))
+        thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        task = results[0]
+        self.assertEqual(task.result.outcome, "cancelled")
+        self.assertTrue(self.runner.removed_runs)
+        self.assertEqual(len(model.requests), 1)
+        self.assertEqual((task.workspace / "note.txt").read_text(encoding="utf-8"), "old\n")
+
+    def test_cancelling_a_finished_task_does_nothing(self):
+        task = self.core(ScriptedModel(tool("list"), final())).start("demo", "Work")
+
+        self.assertFalse(self.core().cancel(task.task_id))
+        self.assertEqual(self.core().show(task.task_id).state, "completed")
+
+    def test_interrupting_the_process_cancels_the_run(self):
+        model = ScriptedModel(tool("list"), KeyboardInterrupt())
+
+        task = self.core(model).start("demo", "Work")
+
+        self.assertEqual(task.result.outcome, "cancelled")
+
+
+class SafeResumeTests(CoreTestCase):
+    def crash_during_check(self):
+        self.runner = CrashingRunner()
+        model = ScriptedModel(edit("note.txt", "kept\n"), tool("check", name="core"))
+        with self.assertRaises(Crash):
+            self.core(model).start("demo", "Work")
+        task_id = self.core().list_tasks()[0].task_id
+        self.core().store._update(task_id, pid=2 ** 22 + 1)
+        self.runner = LocalRunner()
+        return task_id
+
+    def paused_on_outage(self):
+        model = ScriptedModel(edit("note.txt", "kept\n"), ModelUnavailableError("gateway down"))
+        return self.core(model).start("demo", "Work")
+
+    def test_a_crashed_run_shows_as_interrupted(self):
+        task_id = self.crash_during_check()
+
+        self.assertEqual(self.core().show(task_id).state, "interrupted")
+
+    def test_an_outage_pauses_the_task_without_using_fix_attempts_or_retries(self):
+        task = self.paused_on_outage()
+
+        saved = self.core().show(task.task_id)
+        self.assertEqual(saved.state, "paused")
+        self.assertIn("model unavailable", saved.reason)
+        self.assertEqual((saved.counters.fix_attempts, saved.counters.retries), (0, 0))
+
+    def test_a_rejected_key_pauses_the_task(self):
+        task = self.core(ScriptedModel(tool("list"), ModelRejectedError("rejected"))).start("demo", "Work")
+
+        self.assertEqual(task.result.outcome, "paused")
+
+    def test_a_clean_resume_continues_from_saved_history_with_limits_carried_over(self):
+        task = self.paused_on_outage()
+        model = ScriptedModel(final("Finished after resume."))
+
+        resumed = self.core(model).resume(task.task_id)
+
+        self.assertEqual(resumed.result.outcome, "completed")
+        self.assertEqual(resumed.result.counters.actions, 1)
+        self.assertEqual(resumed.result.counters.responses, 2)
+        self.assertIn("kept", json.dumps(model.requests[0]))
+        saved = self.core().show(task.task_id)
+        self.assertEqual(saved.runs, 2)
+        self.assertEqual(saved.changed_files, ("note.txt",))
+
+    def test_limits_are_not_refreshed_by_resuming(self):
+        task = self.core(ScriptedModel(tool("list"), ModelUnavailableError("down")),
+                         limits=RunLimits(actions=1)).start("demo", "Work")
+
+        resumed = self.core(ScriptedModel(tool("list"), final())).resume(task.task_id)
+
+        self.assertIn("Tool action limit", resumed.result.stopped_reason)
+
+    def test_a_changed_workspace_pauses_the_task(self):
+        task = self.paused_on_outage()
+        (task.workspace / "note.txt").write_text("changed by someone else\n", encoding="utf-8")
+        model = ScriptedModel(final())
+
+        resumed = self.core(model).resume(task.task_id)
+
+        self.assertEqual(resumed.result.outcome, "paused")
+        self.assertIn("workspace", resumed.result.stopped_reason)
+        self.assertEqual(model.requests, [])
+        self.assertEqual((task.workspace / "note.txt").read_text(encoding="utf-8"), "changed by someone else\n")
+
+    def test_a_changed_workspace_can_be_accepted_or_discarded_explicitly(self):
+        task = self.paused_on_outage()
+        (task.workspace / "note.txt").write_text("outside\n", encoding="utf-8")
+
+        self.core(ScriptedModel(ModelUnavailableError("down"))).resume(task.task_id, discard_to_checkpoint=True)
+        self.assertEqual((task.workspace / "note.txt").read_text(encoding="utf-8"), "kept\n")
+
+        (task.workspace / "note.txt").write_text("outside again\n", encoding="utf-8")
+        accepted = self.core(ScriptedModel(final())).resume(task.task_id, accept_current_state=True)
+        self.assertEqual(accepted.result.outcome, "completed")
+        self.assertEqual((task.workspace / "note.txt").read_text(encoding="utf-8"), "outside again\n")
+        kinds = [event["choice"] for event in self.core().store.events(task.task_id, "resume_choice")]
+        self.assertEqual(kinds, ["discard_to_checkpoint", "accept_current_state"])
+
+    def test_a_changed_allowlist_pauses_the_task(self):
+        task = self.paused_on_outage()
+        model = ScriptedModel(final())
+
+        changed = self.core(model, {"demo": self.project(allowed_changes=("everything/**",))}).resume(task.task_id)
+        removed = self.core(model, {"other": self.project(name="other")}).resume(task.task_id)
+
+        for result in (changed, removed):
+            self.assertEqual(result.result.outcome, "paused")
+            self.assertIn("allowed project", result.result.stopped_reason)
+        self.assertEqual(model.requests, [])
+
+    def test_an_uncertain_action_pauses_and_is_never_replayed_automatically(self):
+        task_id = self.crash_during_check()
+        model = ScriptedModel(final())
+
+        resumed = self.core(model).resume(task_id)
+
+        self.assertEqual(resumed.result.outcome, "paused")
+        self.assertIn("uncertain action", resumed.result.stopped_reason)
+        self.assertIn("check", resumed.result.stopped_reason)
+        self.assertEqual(model.requests, [])
+        self.assertEqual(self.runner.specs, [])
+        saved = self.core().show(task_id)
+        self.assertEqual(saved.state, "paused")
+        self.assertEqual(saved.steps[-1].status, "started")
+        self.assertIn("half written", saved.diff)
+
+    def test_discarding_an_uncertain_action_restores_the_last_checkpoint(self):
+        task_id = self.crash_during_check()
+        model = ScriptedModel(final())
+
+        resumed = self.core(model).resume(task_id, discard_to_checkpoint=True)
+
+        self.assertEqual(resumed.result.outcome, "completed")
+        self.assertEqual((resumed.workspace / "note.txt").read_text(encoding="utf-8"), "kept\n")
+        self.assertIn("discarded", json.dumps(model.requests[0]))
+        self.assertEqual(self.core().show(task_id).steps[-1].status, "discarded")
+
+    def test_accepting_an_uncertain_action_keeps_the_current_files(self):
+        task_id = self.crash_during_check()
+
+        resumed = self.core(ScriptedModel(final())).resume(task_id, accept_current_state=True)
+
+        self.assertEqual(resumed.result.outcome, "completed")
+        self.assertEqual((resumed.workspace / "note.txt").read_text(encoding="utf-8"), "half written\n")
+        self.assertEqual(self.core().show(task_id).steps[-1].status, "accepted")
+
+    def test_a_completed_task_cannot_be_resumed(self):
+        task = self.core(ScriptedModel(tool("list"), final())).start("demo", "Work")
+
+        with self.assertRaises(ValueError):
+            self.core(ScriptedModel()).resume(task.task_id)
+
+    def test_a_run_still_active_in_another_process_cannot_be_resumed(self):
+        task = self.paused_on_outage()
+        self.core().store._update(task.task_id, state="running", pid=os.getppid())
+
+        with self.assertRaises(ValueError):
+            self.core(ScriptedModel()).resume(task.task_id)
+
+    def test_continuing_keeps_workspace_history_and_consumed_limits_and_survives_compression(self):
+        task = self.core(ScriptedModel(edit("note.txt", "first\n"), final())).start("demo", "Work")
+        model = ScriptedModel(edit("note.txt", "second\n"), final("Refined."))
+
+        continued = self.core(model).continue_task(task.task_id, "Use the word second instead")
+
+        self.assertEqual(continued.result.outcome, "completed")
+        self.assertEqual(continued.result.counters.actions, 2)
+        self.assertIn("Use the word second instead", model.requests[0][1]["content"])
+        self.assertEqual(self.core().show(task.task_id).runs, 2)
+
+
+class ReviewTests(CoreTestCase):
+    def edited_task(self, content="new\n"):
+        return self.core(ScriptedModel(edit("note.txt", content), final())).start("demo", "Edit")
+
+    def test_review_shows_changes_diff_checks_and_unfinished_work_after_a_restart(self):
+        task = self.core(ScriptedModel(edit("note.txt", "new\n"), ModelUnavailableError("down"))).start("demo", "Edit")
+
+        saved = self.core().review(task.task_id)
+
+        self.assertEqual(saved.changed_files, ("note.txt",))
+        self.assertIn("+new", saved.diff)
+        self.assertIn("model unavailable", saved.unfinished)
+
+    def test_nothing_reaches_the_target_until_approved(self):
+        task = self.edited_task()
+
+        self.core().review(task.task_id)
+        self.assertEqual((self.repository / "note.txt").read_text(encoding="utf-8"), "old\n")
+
+        outcome = self.core().approve(task.task_id)
+
+        self.assertEqual(outcome.applied, ("note.txt",))
+        self.assertEqual((self.repository / "note.txt").read_text(encoding="utf-8"), "new\n")
+        self.assertTrue(outcome.passed)
+        self.assertEqual(self.core().show(task.task_id).review_decision, "approved")
+
+    def test_only_allowed_changes_are_applied(self):
+        (self.repository / "tests" / "check.py").write_text(
+            "from pathlib import Path\nPath('artifact.txt').write_text('made by a check')\n", encoding="utf-8")
+        git(self.repository, "add", ".")
+        git(self.repository, "commit", "-qm", "artifact")
+        task = self.edited_task()
+
+        self.core().approve(task.task_id)
+
+        self.assertFalse((self.repository / "artifact.txt").exists())
+
+    def test_post_apply_checks_run_on_a_fresh_copy_and_their_result_is_saved(self):
+        task = self.edited_task()
+
+        outcome = self.core().approve(task.task_id)
+
+        self.assertEqual([check.check_name for check in outcome.post_checks], ["core"])
+        post_workspace = self.runner.specs[-1].workspace
+        self.assertNotEqual(post_workspace, self.repository)
+        self.assertNotEqual(post_workspace, task.workspace)
+        events = self.core().store.events(task.task_id, "post_apply")
+        self.assertTrue(events[0]["passed"])
+
+    def test_a_failed_post_apply_check_is_visible(self):
+        task = self.edited_task()
+        (self.repository / "tests" / "check.py").write_text("raise SystemExit(9)\n", encoding="utf-8")
+        git(self.repository, "add", ".")
+
+        outcome = self.core().approve(task.task_id, force=True)
+
+        self.assertFalse(outcome.passed)
+        self.assertEqual(outcome.post_checks[0].exit_code, 9)
+
+    def test_approval_is_blocked_when_the_target_commit_changed(self):
+        task = self.edited_task()
+        (self.repository / "other.txt").write_text("newer\n", encoding="utf-8")
+        git(self.repository, "add", ".")
+        git(self.repository, "commit", "-qm", "newer")
+
+        outcome = self.core().approve(task.task_id)
+
+        self.assertFalse(outcome.applied)
+        self.assertTrue(any("commit" in difference for difference in outcome.blocked_by))
+        self.assertEqual((self.repository / "note.txt").read_text(encoding="utf-8"), "old\n")
+        self.assertIsNone(self.core().show(task.task_id).review_decision)
+
+    def test_approval_is_blocked_when_a_changed_file_differs_in_the_target(self):
+        task = self.edited_task()
+        (self.repository / "note.txt").write_text("my newer work\n", encoding="utf-8")
+
+        outcome = self.core().approve(task.task_id)
+
+        self.assertTrue(any("note.txt" in difference for difference in outcome.blocked_by))
+        self.assertEqual((self.repository / "note.txt").read_text(encoding="utf-8"), "my newer work\n")
+
+    def test_force_applies_anyway_and_is_recorded(self):
+        task = self.edited_task()
+        (self.repository / "note.txt").write_text("my newer work\n", encoding="utf-8")
+
+        outcome = self.core().approve(task.task_id, force=True)
+
+        self.assertEqual(outcome.applied, ("note.txt",))
+        self.assertEqual((self.repository / "note.txt").read_text(encoding="utf-8"), "new\n")
+        self.assertEqual(self.core().show(task.task_id).review_decision, "approved (forced)")
+
+    def test_rejecting_leaves_the_target_unchanged_and_records_the_decision(self):
+        task = self.edited_task()
+
+        self.core().reject(task.task_id)
+
+        self.assertEqual((self.repository / "note.txt").read_text(encoding="utf-8"), "old\n")
+        self.assertEqual(self.core().show(task.task_id).review_decision, "rejected")
+
+    def test_a_decided_task_cannot_be_decided_again_or_continued(self):
+        task = self.edited_task()
+        self.core().approve(task.task_id)
+
+        for action in (lambda core: core.approve(task.task_id), lambda core: core.reject(task.task_id),
+                       lambda core: core.continue_task(task.task_id, "more")):
+            with self.assertRaises(ValueError):
+                action(self.core(ScriptedModel()))
+
+    def test_a_task_with_no_changes_has_nothing_to_approve(self):
+        task = self.core(ScriptedModel(tool("list"), final())).start("demo", "Look")
+
+        with self.assertRaises(ValueError):
+            self.core().approve(task.task_id)
 
 
 if __name__ == "__main__":

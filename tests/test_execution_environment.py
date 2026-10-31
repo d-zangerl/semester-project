@@ -1,5 +1,7 @@
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -170,6 +172,27 @@ print("confined")
         environment, result = self.run_source("import time; time.sleep(60)", timeout_seconds=3)
 
         self.assertTrue(result.timed_out)
+        self.assertEqual(self.containers(environment.run_id), "")
+
+    def test_stopping_a_stuck_check_leaves_no_container(self):
+        (self.workspace / "check.py").write_text("import time; time.sleep(60)", encoding="utf-8")
+        environment = ExecutionEnvironment(checks={"core": ("python", "check.py")})
+        results = []
+        worker = threading.Thread(target=lambda: results.append(environment.run_check("core", self.workspace)))
+        worker.start()
+        for _ in range(200):
+            if subprocess.run(["docker", "ps", "-q", "--filter", f"label=coding-harness.run={environment.run_id}",
+                               "--filter", "status=running"], capture_output=True, text=True).stdout.strip():
+                time.sleep(2)  # past the boundary probe's short-lived container
+                if self.containers(environment.run_id):
+                    break
+            time.sleep(0.1)
+
+        environment.stop()
+        worker.join(30)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(results[0].passed)
         self.assertEqual(self.containers(environment.run_id), "")
 
     def test_completed_check_leaves_no_container(self):

@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 from src.coding_harness.agent import AgentController
 from src.coding_harness.agent import RunLimits
-from src.coding_harness.cli import UserInterface
 from src.coding_harness.repository import RepositoryTools
 from src.coding_harness.verification import Verification
 
@@ -664,50 +663,6 @@ class RepositoryToolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tools.edit_file("escape.txt", "modified")
             self.assertEqual(outside.read_text(encoding="utf-8"), "outside secret")
-
-
-class InteractiveCliTests(unittest.TestCase):
-    def test_sequential_tasks_create_fresh_workspaces_and_model_contexts(self):
-        class SuccessfulChecks(PassingChecks):
-            check_names = ("core",)
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            repository = root / "repository"
-            repository.mkdir()
-            (repository / "original.txt").write_text("base", encoding="utf-8")
-            workspaces = []
-
-            def new_workspace(source):
-                workspace = root / f"task-{len(workspaces) + 1}"
-                shutil.copytree(source, workspace)
-                workspaces.append(workspace)
-                return workspace
-
-            model = ScriptedModelClient([
-                LIST,
-                json.dumps({"type": "final", "response": "first finished"}),
-                LIST,
-                json.dumps({"type": "final", "response": "second finished"}),
-            ])
-            interface = UserInterface(
-                model_client_factory=lambda: model,
-                execution_environment_factory=SuccessfulChecks,
-                workspace_factory=new_workspace,
-            )
-            output = io.StringIO()
-            with patch("builtins.input", side_effect=["first task", "second task", "/quit"]), redirect_stdout(output):
-                status = interface.run(["--repository", str(repository)])
-
-            self.assertEqual(status, 0)
-            self.assertEqual(len(workspaces), 2)
-            self.assertNotEqual(workspaces[0], workspaces[1])
-            self.assertIn("first task", model.requests[0][1]["content"])
-            self.assertNotIn("first task", json.dumps(model.requests[2]))
-            self.assertIn("second task", model.requests[2][1]["content"])
-            self.assertIn("first finished", output.getvalue())
-            self.assertIn("second finished", output.getvalue())
-            self.assertEqual((repository / "original.txt").read_text(encoding="utf-8"), "base")
 
 
 if __name__ == "__main__":

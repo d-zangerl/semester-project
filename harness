@@ -1,0 +1,4 @@
+#!/bin/sh
+# Launcher: runs the harness with the project's virtual environment.
+root="$(cd "$(dirname "$0")" && pwd)"
+exec "$root/.venv/bin/python" "$root/src/main.py" "$@"

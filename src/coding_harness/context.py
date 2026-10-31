@@ -113,15 +113,19 @@ class ContextManager:
         return self.limits.history // 6
 
     def _summary(self) -> str:
-        lines = []
+        lines, edited = [], []
         for step in self.steps():
-            arguments = {key: value for key, value in json.loads(step["arguments"]).items()
-                         if key in {"path", "name", "query", "start", "end", "function"}}
+            arguments = json.loads(step["arguments"])
+            if step["tool"] == "edit" and not step["denied"] and arguments.get("path") not in edited:
+                edited.append(arguments.get("path"))
+            shown = {key: value for key, value in arguments.items()
+                     if key in {"path", "name", "query", "start", "end", "function"}}
             state = "denied" if step["denied"] else step["status"]
-            lines.append(f"{step['tool']} {json.dumps(arguments, ensure_ascii=False)[:120]}: {state}")
+            lines.append(f"{step['tool']} {json.dumps(shown, ensure_ascii=False)[:120]}: {state}")
+        header = f"Files edited so far: {', '.join(edited) or '(none)'}\n"
         text = "\n".join(lines)
-        limit = self._summary_budget() * 4
-        return text if len(text) <= limit else "[earlier steps omitted]\n" + text[-limit:]
+        limit = max(self._summary_budget() * 4 - len(header), 0)
+        return header + (text if len(text) <= limit else "[earlier steps omitted]\n" + text[-limit:])
 
     def build(self, messages: list[dict]) -> list[dict]:
         trusted, later = messages[:2], messages[2:]
