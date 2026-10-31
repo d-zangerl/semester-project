@@ -1,219 +1,181 @@
-import os
-import signal
-import sys
 import subprocess
 import tempfile
-import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
-from src.coding_harness.execution import ExecutionEnvironment
+from src.coding_harness.execution import (
+    DEFAULT_IMAGE, ContainerSpec, DockerRunner, ExecutionEnvironment, docker_arguments,
+)
+from tests.fakes import LocalRunner
 
 
-class ExecutionEnvironmentTests(unittest.TestCase):
+class ContainerCheckTests(unittest.TestCase):
+    """Check behaviour at the container runner seam, with no Docker needed."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.workspace = Path(directory.name)
+
+    def environment(self, runner, source="print('fine')", **options):
+        (self.workspace / "check.py").write_text(source, encoding="utf-8")
+        return ExecutionEnvironment(checks={"core": ("python", "check.py")}, runner=runner, **options)
+
     def test_explicit_empty_check_configuration_does_not_run_default_check(self):
-        runner = ExecutionEnvironment(checks={})
+        self.assertEqual(ExecutionEnvironment(checks={}, runner=LocalRunner()).check_names, ())
 
-        self.assertEqual(runner.check_names, ())
+    def test_a_passing_check_reports_its_output(self):
+        result = self.environment(LocalRunner()).run_check("core", self.workspace)
 
-    def test_configured_check_is_confined_to_its_workspace(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            workspace = root / "workspace"
-            outside = root / "outside"
-            workspace.mkdir()
-            outside.mkdir()
-            protected_file = outside / "host-marker.txt"
-            protected_file.write_text("host data", encoding="utf-8")
-            (workspace / "sandbox_probe.py").write_text(
-                """
-import socket
-import sys
-import hashlib
+        self.assertTrue(result.passed)
+        self.assertEqual(result.check_name, "core")
+        self.assertEqual(result.stdout.strip(), "fine")
+
+    def test_failed_check_keeps_exit_code_and_bounded_output(self):
+        result = self.environment(LocalRunner(), "print('x' * 500); raise SystemExit(7)",
+                                  output_limit_bytes=100).run_check("core", self.workspace)
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.exit_code, 7)
+        self.assertEqual(len(result.stdout), 100)
+        self.assertTrue(result.stdout_truncated)
+
+    def test_timed_out_check_never_appears_as_passed(self):
+        result = self.environment(LocalRunner(), "import time; time.sleep(30)",
+                                  timeout_seconds=0.2).run_check("core", self.workspace)
+
+        self.assertTrue(result.timed_out)
+        self.assertFalse(result.passed)
+
+    def test_unconfigured_check_is_blocked_without_running_anything(self):
+        runner = LocalRunner()
+        result = self.environment(runner).run_check("other", self.workspace)
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(runner.specs, [])
+
+    def test_unavailable_docker_runs_no_repository_code(self):
+        runner = LocalRunner(unavailable="Docker daemon is not running.")
+        result = self.environment(runner).run_check("core", self.workspace)
+
+        self.assertTrue(result.blocked)
+        self.assertFalse(result.passed)
+        self.assertIn("Docker daemon is not running.", result.error)
+        self.assertEqual(runner.specs, [])
+
+    def test_a_failed_boundary_probe_runs_no_repository_code(self):
+        runner = LocalRunner(probe_exit_code=1)
+        result = self.environment(runner).run_check("core", self.workspace)
+
+        self.assertTrue(result.blocked)
+        self.assertEqual([spec.purpose for spec in runner.specs], ["probe"])
+
+    def test_stopping_removes_the_runs_containers_and_blocks_further_checks(self):
+        runner = LocalRunner()
+        environment = self.environment(runner)
+
+        environment.stop()
+        result = environment.run_check("core", self.workspace)
+
+        self.assertEqual(runner.removed_runs, [environment.run_id])
+        self.assertTrue(result.blocked)
+        self.assertEqual(runner.specs, [])
+
+    def test_acceptance_checks_receive_a_read_only_mount(self):
+        runner = LocalRunner()
+        self.environment(runner, read_only_mounts={"/host/acceptance": "/acceptance"}).run_check("core", self.workspace)
+
+        self.assertEqual(runner.specs[-1].read_only_mounts, {"/host/acceptance": "/acceptance"})
+
+    def test_containers_are_locked_down(self):
+        spec = ContainerSpec(("python", "check.py"), self.workspace, "image:1", "run-1",
+                             read_only_mounts={"/host/acceptance": "/acceptance"})
+
+        arguments = docker_arguments(spec, "name")
+
+        text = " ".join(arguments)
+        for expected in ("--network none", "--cap-drop ALL", "--read-only", "--user 1000:1000", "--memory",
+                         "--cpus", "--pids-limit", "--label coding-harness.run=run-1",
+                         "/host/acceptance:/acceptance:ro", f"{self.workspace}:/workspace"):
+            self.assertIn(expected, text)
+        self.assertEqual(arguments[-3:], ["image:1", "python", "check.py"])
+
+    def test_container_environment_holds_no_host_secrets(self):
+        spec = ContainerSpec(("python", "check.py"), self.workspace, "image:1", "run-1")
+
+        with unittest.mock.patch.dict("os.environ", {"OPENAI_API_KEY": "secret-value"}):
+            text = " ".join(docker_arguments(spec, "name"))
+
+        self.assertNotIn("OPENAI_API_KEY", text)
+        self.assertNotIn("secret-value", text)
+
+    def test_missing_docker_client_is_reported_as_unavailable(self):
+        self.assertIn("not found", DockerRunner(docker="no-such-docker").unavailable_reason("image"))
+
+
+REAL_DOCKER_UNAVAILABLE = DockerRunner().unavailable_reason(DEFAULT_IMAGE)
+
+
+@unittest.skipIf(REAL_DOCKER_UNAVAILABLE, f"Real Docker tests skipped: {REAL_DOCKER_UNAVAILABLE}")
+class RealDockerTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(dir=Path.home() / ".cache" if (Path.home() / ".cache").is_dir() else None)
+        self.addCleanup(directory.cleanup)
+        self.workspace = Path(directory.name).resolve()
+        self.workspace.chmod(0o777)
+
+    def run_source(self, source, **options):
+        (self.workspace / "check.py").write_text(source, encoding="utf-8")
+        environment = ExecutionEnvironment(checks={"core": ("python", "check.py")}, **options)
+        return environment, environment.run_check("core", self.workspace)
+
+    def containers(self, run_id):
+        return subprocess.run(["docker", "ps", "-aq", "--filter", f"label=coding-harness.run={run_id}"],
+                              capture_output=True, text=True).stdout.strip()
+
+    def test_check_is_confined_to_its_workspace(self):
+        outside = self.workspace.parent / "host-marker-should-not-be-visible"
+        _, result = self.run_source(f"""
+import socket, os
 from pathlib import Path
-
-protected_file = Path(sys.argv[1])
-if len(hashlib.pbkdf2_hmac("sha256", b"password", b"salt", 1)) != 32:
-    raise RuntimeError("Python cryptographic runtime is unavailable")
-try:
-    protected_file.read_text(encoding="utf-8")
-except OSError:
-    print("host-read-blocked")
-else:
-    print("host-read-allowed")
-    raise SystemExit(1)
-
-try:
-    protected_file.write_text("changed", encoding="utf-8")
-except OSError:
-    print("host-write-blocked")
-else:
-    print("host-write-allowed")
-    raise SystemExit(1)
-
-try:
-    with socket.socket() as connection:
-        connection.bind(("127.0.0.1", 0))
-except OSError:
-    print("network-blocked")
-else:
-    print("network-allowed")
-    raise SystemExit(1)
-
-Path("workspace-result.txt").write_text("contained", encoding="utf-8")
-print("workspace-write-allowed")
-""".lstrip(),
-                encoding="utf-8",
-            )
-
-            result = ExecutionEnvironment(
-                checks={"core": (sys.executable, "sandbox_probe.py", str(protected_file))}
-            ).run_check("core", workspace)
-
-            self.assertTrue(result.passed, result)
-            self.assertIn("host-read-blocked", result.stdout)
-            self.assertIn("host-write-blocked", result.stdout)
-            self.assertIn("network-blocked", result.stdout)
-            self.assertIn("workspace-write-allowed", result.stdout)
-            self.assertEqual(
-                (workspace / "workspace-result.txt").read_text(encoding="utf-8"),
-                "contained",
-            )
-            self.assertEqual(protected_file.read_text(encoding="utf-8"), "host data")
-
-    def test_check_is_not_run_when_sandbox_is_unavailable(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            workspace = Path(temporary_directory)
-            marker = workspace / "should-not-exist"
-            runner = ExecutionEnvironment(
-                checks={"core": (sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")},
-                sandbox_executable="/missing/sandbox-exec",
-            )
-
-            result = runner.run_check("core", workspace)
-
-            self.assertTrue(result.blocked)
-            self.assertFalse(result.passed)
-            self.assertIsNone(result.exit_code)
-            self.assertFalse(marker.exists())
-
-    def test_timed_out_check_stops_its_child_process(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            workspace = Path(temporary_directory)
-            child_pid_file = workspace / "child.pid"
-            child_group_file = workspace / "child-group.txt"
-            child_script = f"""
-import os
-import pathlib
-import time
-
-group = pathlib.Path({str(child_group_file)!r})
-escaped = False
-for change_group in (os.setsid, lambda: os.setpgid(0, 0)):
+Path("written.txt").write_text("workspace")
+assert not Path({str(outside)!r}).exists()
+assert os.geteuid() != 0
+for target in ("/etc/written", "/usr/written"):
     try:
-        change_group()
+        Path(target).write_text("x")
     except OSError:
         pass
     else:
-        escaped = True
-group.write_text("escaped" if escaped else "blocked")
-time.sleep(5)
-"""
-            script = (
-                "import pathlib, subprocess, sys, time; "
-                f"child = subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
-                f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid)); "
-                "time.sleep(30)"
-            )
-            runner = ExecutionEnvironment(
-                checks={"core": (sys.executable, "-c", script)},
-                timeout_seconds=0.7,
-            )
+        raise SystemExit("root filesystem is writable")
+try:
+    socket.create_connection(("1.1.1.1", 53), timeout=2)
+except OSError:
+    pass
+else:
+    raise SystemExit("network is reachable")
+print("confined")
+""")
+        self.assertTrue(result.passed, result.stdout + result.stderr + str(result.error))
+        self.assertTrue((self.workspace / "written.txt").exists())
 
-            result = runner.run_check("core", workspace)
+    def test_failed_check_keeps_its_exit_code(self):
+        _, result = self.run_source("print('failing'); raise SystemExit(7)")
 
-            child_pid = child_pid_file.read_text(encoding="utf-8")
-            try:
-                self.assertTrue(result.timed_out)
-                self.assertFalse(result.passed)
-                self.assertEqual(child_group_file.read_text(encoding="utf-8"), "blocked")
-                process_state = subprocess.run(
-                    ["/bin/ps", "-o", "stat=", "-p", child_pid],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                ).stdout.strip()
-                self.assertTrue(not process_state or process_state.startswith("Z"), process_state)
-            finally:
-                try:
-                    os.kill(int(child_pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+        self.assertEqual(result.exit_code, 7)
+        self.assertIn("failing", result.stdout)
 
-    def test_completed_check_does_not_leave_background_children_running(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            workspace = Path(temporary_directory)
-            child_pid_file = workspace / "child.pid"
-            heartbeat_file = workspace / "child-heartbeat.txt"
-            child_script = f"""
-import pathlib
-import time
+    def test_timed_out_check_leaves_no_container(self):
+        environment, result = self.run_source("import time; time.sleep(60)", timeout_seconds=3)
 
-heartbeat = pathlib.Path({str(heartbeat_file)!r})
-while True:
-    heartbeat.write_text(str(time.monotonic()))
-    time.sleep(0.02)
-"""
-            script = f"""
-import pathlib
-import subprocess
-import sys
-import time
+        self.assertTrue(result.timed_out)
+        self.assertEqual(self.containers(environment.run_id), "")
 
-child = subprocess.Popen([sys.executable, "-c", {child_script!r}])
-pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid))
-deadline = time.monotonic() + 2
-while not pathlib.Path({str(heartbeat_file)!r}).exists() and time.monotonic() < deadline:
-    time.sleep(0.01)
-"""
-            result = ExecutionEnvironment(
-                checks={"core": (sys.executable, "-c", script)}
-            ).run_check("core", workspace)
+    def test_completed_check_leaves_no_container(self):
+        environment, _ = self.run_source("print('done')")
 
-            self.assertTrue(result.passed, result)
-            child_pid = child_pid_file.read_text(encoding="utf-8")
-            try:
-                heartbeat = heartbeat_file.read_text(encoding="utf-8")
-                time.sleep(0.1)
-                self.assertEqual(heartbeat_file.read_text(encoding="utf-8"), heartbeat)
-                process_state = subprocess.run(
-                    ["/bin/ps", "-o", "stat=", "-p", child_pid],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                ).stdout.strip()
-                self.assertTrue(not process_state or process_state.startswith("Z"), process_state)
-            finally:
-                try:
-                    os.kill(int(child_pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-
-    def test_failed_check_keeps_exit_code_and_bounded_output(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            workspace = Path(temporary_directory)
-            script = "import sys; print('x' * 200); print('failure', file=sys.stderr); raise SystemExit(7)"
-            result = ExecutionEnvironment(
-                checks={"core": (sys.executable, "-c", script)},
-                output_limit_bytes=32,
-            ).run_check("core", workspace)
-
-            self.assertFalse(result.passed)
-            self.assertEqual(result.exit_code, 7)
-            self.assertTrue(result.stdout_truncated)
-            self.assertLessEqual(len(result.stdout.encode("utf-8")), 32)
-            self.assertIn("failure", result.stderr)
-            self.assertFalse(result.stderr_truncated)
+        self.assertEqual(self.containers(environment.run_id), "")
 
 
 if __name__ == "__main__":

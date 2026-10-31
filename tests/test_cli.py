@@ -1,7 +1,6 @@
 import io
 import json
 import shutil
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -10,6 +9,7 @@ from unittest.mock import patch
 
 from src.coding_harness.cli import UserInterface
 from src.coding_harness.execution import ExecutionEnvironment
+from tests.fakes import LocalRunner
 
 
 class ScriptedModelClient:
@@ -40,7 +40,7 @@ class CommandLineTests(unittest.TestCase):
         interface = UserInterface(
             model_client_factory=lambda: ScriptedModelClient("unused"),
             execution_environment_factory=lambda: ExecutionEnvironment(
-                checks={"core": (sys.executable, "tests/test_core.py")}
+                checks={"core": ("python", "tests/test_core.py")}, runner=LocalRunner()
             ),
         )
         with patch("builtins.input", side_effect=["Check the fixture repository", "/quit"]), redirect_stdout(output):

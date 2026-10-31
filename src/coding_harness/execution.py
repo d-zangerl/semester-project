@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import os
 import shutil
-import signal
 import subprocess
-import sys
-import sysconfig
-import tempfile
 import threading
 import time
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Sequence
+
+DEFAULT_IMAGE = "coding-harness-check:1"
+BUILD_HINT = "docker build -t coding-harness-check:1 -f docker/check.Dockerfile target-repository"
+RUN_LABEL = "coding-harness.run"
+OWNER_LABEL = "coding-harness.owner-pid"
+_DOCKER_CONTROL_TIMEOUT = 30
 
 
 @dataclass(frozen=True)
@@ -30,6 +33,45 @@ class CheckResult:
     @property
     def passed(self) -> bool:
         return not self.blocked and not self.timed_out and self.exit_code == 0
+
+
+@dataclass(frozen=True)
+class ContainerSpec:
+    command: tuple[str, ...]
+    workspace: Path
+    image: str
+    run_id: str
+    purpose: str = "check"
+    read_only_mounts: Mapping[str, str] = field(default_factory=dict)
+    memory: str = "1g"
+    cpus: str = "2"
+    pids: int = 256
+
+
+def docker_arguments(spec: ContainerSpec, name: str) -> list[str]:
+    arguments = [
+        "run", "--rm", "--name", name,
+        "--label", f"{RUN_LABEL}={spec.run_id}",
+        "--label", f"{OWNER_LABEL}={os.getpid()}",
+        "--network", "none",
+        "--user", "1000:1000",
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges",
+        "--read-only",
+        "--tmpfs", "/tmp",
+        "--memory", spec.memory,
+        "--cpus", spec.cpus,
+        "--pids-limit", str(spec.pids),
+        "--env", "HOME=/tmp",
+        "--env", "TMPDIR=/tmp",
+        "--env", "PYTHONDONTWRITEBYTECODE=1",
+        "--env", "LANG=C.UTF-8",
+        "--volume", f"{spec.workspace}:/workspace",
+        "--workdir", "/workspace",
+    ]
+    for source, target in spec.read_only_mounts.items():
+        arguments += ["--volume", f"{source}:{target}:ro"]
+    return [*arguments, spec.image, *spec.command]
 
 
 class _BoundedStream:
@@ -58,8 +100,102 @@ class _BoundedStream:
         return b"".join(self.chunks).decode("utf-8", errors="replace")
 
 
+class DockerRunner:
+    """The only code that talks to Docker."""
+
+    def __init__(self, docker: str = "docker"):
+        self.docker = docker
+
+    def _control(self, *arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run([self.docker, *arguments], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                              timeout=_DOCKER_CONTROL_TIMEOUT)
+
+    def unavailable_reason(self, image: str) -> str | None:
+        if shutil.which(self.docker) is None:
+            return f"Docker client {self.docker!r} was not found."
+        try:
+            if self._control("version", "--format", "{{.Server.Version}}").returncode != 0:
+                return "Docker daemon is not running or not reachable."
+            if self._control("image", "inspect", image).returncode != 0:
+                return f"Check image {image} is not built. Build it with: {BUILD_HINT}"
+        except (OSError, subprocess.SubprocessError) as error:
+            return f"Docker could not be reached: {type(error).__name__}."
+        return None
+
+    def run(self, spec: ContainerSpec, timeout_seconds: float, output_limit_bytes: int) -> CheckResult:
+        started = time.monotonic()
+        name = f"coding-harness-{uuid.uuid4().hex}"
+        try:
+            process = subprocess.Popen([self.docker, *docker_arguments(spec, name)], stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except OSError as error:
+            return CheckResult("", None, "", "", False, False, error=str(error),
+                               duration_seconds=time.monotonic() - started)
+        stdout = _BoundedStream(process.stdout, output_limit_bytes)
+        stderr = _BoundedStream(process.stderr, output_limit_bytes)
+        readers = [threading.Thread(target=stream.drain, daemon=True) for stream in (stdout, stderr)]
+        for reader in readers:
+            reader.start()
+        timed_out = False
+        try:
+            process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            self._remove_container(name, process)
+        except BaseException:
+            self._remove_container(name, process)
+            raise
+        finally:
+            for reader in readers:
+                reader.join(timeout=5)
+        return CheckResult("", None if timed_out else process.returncode, stdout.text, stderr.text,
+                           stdout.truncated, stderr.truncated, timed_out=timed_out,
+                           duration_seconds=time.monotonic() - started)
+
+    def _remove_container(self, name: str, process: subprocess.Popen) -> None:
+        try:
+            self._control("rm", "-f", name)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        process.kill()
+        process.wait()
+
+    def _labelled_containers(self, *filters: str) -> list[str]:
+        arguments = ["ps", "-aq"]
+        for value in filters:
+            arguments += ["--filter", f"label={value}"]
+        return self._control(*arguments).stdout.split()
+
+    def remove_run(self, run_id: str) -> None:
+        containers = self._labelled_containers(f"{RUN_LABEL}={run_id}")
+        if containers:
+            self._control("rm", "-f", *containers)
+
+    def remove_stale(self) -> list[str]:
+        """Remove containers whose owning harness process no longer exists."""
+        removed = []
+        listing = self._control("ps", "-a", "--filter", f"label={OWNER_LABEL}",
+                                "--format", f'{{{{.ID}}}} {{{{.Label "{OWNER_LABEL}"}}}}').stdout
+        for line in listing.splitlines():
+            container, _, owner = line.partition(" ")
+            if owner.isdigit() and not _process_exists(int(owner)):
+                self._control("rm", "-f", container)
+                removed.append(container)
+        return removed
+
+
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 class ExecutionEnvironment:
-    """Runs fixed, configured checks under the macOS App Sandbox profile."""
+    """Runs fixed, configured checks in new, locked-down containers, and fails closed."""
 
     def __init__(
         self,
@@ -67,9 +203,12 @@ class ExecutionEnvironment:
         *,
         timeout_seconds: float = 60,
         output_limit_bytes: int = 64 * 1024,
-        sandbox_executable: str | None = None,
+        image: str = DEFAULT_IMAGE,
+        runner=None,
+        run_id: str | None = None,
+        read_only_mounts: Mapping[str, str] | None = None,
     ):
-        configured_checks = {"core": (sys.executable, "tests/test_core.py")} if checks is None else checks
+        configured_checks = {"core": ("python", "tests/test_core.py")} if checks is None else checks
         self._checks = {
             name: tuple(command)
             for name, command in configured_checks.items()
@@ -81,372 +220,79 @@ class ExecutionEnvironment:
             raise ValueError("Check timeout and output limit must be positive.")
         self._timeout_seconds = timeout_seconds
         self._output_limit_bytes = output_limit_bytes
-        self._sandbox_executable = sandbox_executable
+        self._image = image
+        self._runner = runner or DockerRunner()
+        self.run_id = run_id or uuid.uuid4().hex
+        self._read_only_mounts = dict(read_only_mounts or {})
+        self._stopped = False
 
     @property
     def check_names(self) -> tuple[str, ...]:
         return tuple(self._checks)
+
+    def stop(self) -> None:
+        """Kill this run's containers and refuse further checks."""
+        self._stopped = True
+        self._runner.remove_run(self.run_id)
 
     def run_check(self, check_name: str, workspace: str | Path) -> CheckResult:
         started = time.monotonic()
         command = self._checks.get(check_name)
         if command is None:
             return self._blocked(check_name, f"Check is not configured: {check_name!r}.", started)
-        if sys.platform != "darwin":
-            return self._blocked(check_name, "OS-enforced sandbox is unavailable on this platform.", started)
-
-        sandbox = self._resolve_sandbox()
-        if sandbox is None:
-            return self._blocked(
-                check_name,
-                "macOS sandbox-exec was not found; repository code was not run.",
-                started,
-            )
-
+        if self._stopped:
+            return self._blocked(check_name, "The run was stopped; repository code was not run.", started)
         try:
             task_workspace = Path(workspace).resolve(strict=True)
             if not task_workspace.is_dir():
                 raise ValueError("Task workspace is not a directory.")
-            environment = self._runtime_environment(task_workspace)
-            profile = self._profile(task_workspace)
-            with tempfile.TemporaryDirectory(prefix="coding-harness-sandbox-probe-") as probe_directory:
-                protected_file = Path(probe_directory) / "protected-marker"
-                protected_file.write_text("protected", encoding="utf-8")
-                probe = self._run_process(
-                    (
-                        sandbox,
-                        "-p",
-                        profile,
-                        str(Path(sys.executable).resolve()),
-                        "-c",
-                        self._probe_code(),
-                        str(protected_file),
-                    ),
-                    task_workspace,
-                    environment,
-                    min(self._timeout_seconds, 10),
-                )
-                if probe.error or probe.timed_out or probe.exit_code != 0:
-                    return self._blocked(
-                        check_name,
-                        "Sandbox boundary verification failed; repository code was not run. "
-                        + self._process_error(probe),
-                        started,
-                        stdout=probe.stdout,
-                        stderr=probe.stderr,
-                    )
-                if probe.stdout_truncated or probe.stderr_truncated:
-                    return self._blocked(
-                        check_name,
-                        "Sandbox boundary verification output was truncated; repository code was not run.",
-                        started,
-                        stdout=probe.stdout,
-                        stderr=probe.stderr,
-                    )
-
-            result = self._run_process(
-                (sandbox, "-p", profile, *self._resolve_command(command)),
-                task_workspace,
-                environment,
-                self._timeout_seconds,
-            )
-            return CheckResult(
-                check_name=check_name,
-                exit_code=result.exit_code,
-                stdout=result.stdout,
-                stderr=result.stderr,
-                stdout_truncated=result.stdout_truncated,
-                stderr_truncated=result.stderr_truncated,
-                timed_out=result.timed_out,
-                blocked=result.error is not None,
-                error=result.error,
-                duration_seconds=time.monotonic() - started,
-            )
+            reason = self._runner.unavailable_reason(self._image)
+            if reason:
+                return self._blocked(check_name, f"{reason} Repository code was not run.", started)
+            probe = self._runner.run(self._spec(("python", "-c", _PROBE_CODE), task_workspace, "probe"),
+                                     min(self._timeout_seconds, 30), self._output_limit_bytes)
+            if probe.error or probe.timed_out or probe.exit_code != 0:
+                details = probe.error or probe.stderr.strip() or probe.stdout.strip() or "probe did not finish"
+                return self._blocked(check_name, f"Container boundary verification failed; repository code was "
+                                                 f"not run. {details}", started)
+            result = self._runner.run(self._spec(command, task_workspace, "check"),
+                                      self._timeout_seconds, self._output_limit_bytes)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
-            return self._blocked(
-                check_name,
-                f"Sandbox setup failed; repository code was not run: {error}",
-                started,
-            )
+            return self._blocked(check_name, f"Container setup failed; repository code was not run: {error}", started)
+        return CheckResult(check_name, result.exit_code, result.stdout, result.stderr, result.stdout_truncated,
+                           result.stderr_truncated, timed_out=result.timed_out,
+                           blocked=result.error is not None, error=result.error,
+                           duration_seconds=time.monotonic() - started)
 
-    def _resolve_sandbox(self) -> str | None:
-        executable = self._sandbox_executable or shutil.which("sandbox-exec")
-        if executable is None:
-            return None
-        resolved = shutil.which(executable)
-        if resolved is None or not os.access(resolved, os.X_OK):
-            return None
-        return str(Path(resolved).resolve())
+    def _spec(self, command: tuple[str, ...], workspace: Path, purpose: str) -> ContainerSpec:
+        return ContainerSpec(command, workspace, self._image, self.run_id, purpose, self._read_only_mounts)
 
     @staticmethod
-    def _runtime_environment(workspace: Path) -> dict[str, str]:
-        home = workspace / ".harness-home"
-        temporary = workspace / ".harness-tmp"
-        home.mkdir(exist_ok=True)
-        temporary.mkdir(exist_ok=True)
-        return {
-            "HOME": str(home),
-            "TMPDIR": str(temporary),
-            "PATH": str(Path(sys.executable).resolve().parent),
-            "PYTHONNOUSERSITE": "1",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "LANG": "C",
-            "LC_ALL": "C",
-        }
+    def _blocked(check_name: str, error: str, started: float) -> CheckResult:
+        return CheckResult(check_name, None, "", "", False, False, blocked=True, error=error,
+                           duration_seconds=time.monotonic() - started)
 
-    @staticmethod
-    def _profile(workspace: Path) -> str:
-        python_executable = str(Path(sys.executable).resolve())
-        runtime_executables = {Path(python_executable)}
-        framework_executable = Path(sys.prefix) / "Resources/Python.app/Contents/MacOS/Python"
-        if framework_executable.is_file():
-            runtime_executables.add(framework_executable.resolve())
-        read_roots = {
-            "/System",
-            "/usr/bin",
-            "/usr/lib",
-            "/usr/share",
-            "/private/var/db/dyld",
-            str(Path(python_executable).parent),
-        }
-        runtime_library_roots = {
-            path.resolve()
-            for path in (Path(sys.prefix) / "lib", Path(sys.base_prefix) / "lib")
-            if path.is_dir()
-        }
-        library_directory = sysconfig.get_config_var("LIBDIR")
-        if library_directory and Path(library_directory).is_dir():
-            runtime_library_roots.add(Path(library_directory).resolve())
-        read_roots.update(str(path) for path in runtime_library_roots)
-        for key in ("stdlib", "platstdlib", "purelib", "platlib"):
-            value = sysconfig.get_paths().get(key)
-            if value:
-                read_roots.add(str(Path(value).resolve()))
 
-        runtime_libraries = {Path(sys.prefix) / "Python"}
-        library_name = sysconfig.get_config_var("LDLIBRARY")
-        if library_directory and library_name:
-            runtime_libraries.add(Path(library_directory) / library_name)
-        runtime_libraries = {
-            path.resolve()
-            for path in runtime_libraries
-            if path.is_file()
-        }
-
-        rules = [
-            "(version 1)",
-            '(import "system.sb")',
-            "(deny default)",
-            "(allow process-fork)",
-            "(allow sysctl-read)",
-            "(deny network*)",
-            "(deny syscall-unix (syscall-number SYS_setsid))",
-            "(deny syscall-unix (syscall-number SYS_setpgid))",
-            "(allow file-read* (subpath \"/System\") (subpath \"/usr/bin\") "
-            "(subpath \"/usr/lib\") (subpath \"/usr/share\") "
-            "(subpath \"/private/var/db/dyld\") "
-            "(literal \"/dev/null\") (literal \"/dev/urandom\"))",
-        ]
-        rules.extend(
-            f"(allow process-exec (literal {_sbpl_quote(str(executable))}))"
-            for executable in sorted(runtime_executables)
-        )
-        rules.extend(f"(allow file-read* (subpath {_sbpl_quote(root)}))" for root in sorted(read_roots))
-        rules.extend(
-            f"(allow file-read* file-map-executable (literal {_sbpl_quote(str(executable))}))"
-            for executable in sorted(runtime_executables)
-        )
-        rules.extend(
-            f"(allow file-map-executable (subpath {_sbpl_quote(str(root))}))"
-            for root in sorted(runtime_library_roots)
-        )
-        rules.extend(
-            f"(allow file-read* file-map-executable (literal {_sbpl_quote(str(library))}))"
-            for library in sorted(runtime_libraries)
-        )
-        rules.extend(
-            f"(allow file-read-metadata (path-ancestors {_sbpl_quote(root)}))"
-            for root in sorted(read_roots | {str(workspace)} | {str(path) for path in runtime_libraries})
-        )
-        rules.extend(
-            [
-                f"(allow file-read* (subpath {_sbpl_quote(str(workspace))}))",
-                f"(allow file-write* (subpath {_sbpl_quote(str(workspace))}))",
-                "(allow file-write* (literal \"/dev/null\"))",
-            ]
-        )
-        return "\n".join(rules)
-
-    @staticmethod
-    def _probe_code() -> str:
-        return """
+_PROBE_CODE = """
+import os
 import socket
-import sys
 from pathlib import Path
 
-if len(__import__("hashlib").pbkdf2_hmac("sha256", b"probe", b"salt", 1)) != 32:
-    raise RuntimeError("Python cryptographic runtime is unavailable")
-
-protected = Path(sys.argv[1])
-workspace_probe = Path(".harness-sandbox-probe-" + str(__import__("uuid").uuid4()))
+marker = Path(".harness-probe-" + str(os.getpid()))
+marker.write_text("workspace")
+marker.unlink()
+if os.geteuid() == 0:
+    raise SystemExit("container runs as root")
 try:
-    workspace_probe.write_text("workspace", encoding="utf-8")
-    if workspace_probe.read_text(encoding="utf-8") != "workspace":
-        raise RuntimeError("workspace read/write probe failed")
-finally:
-    workspace_probe.unlink(missing_ok=True)
-
-try:
-    protected.read_text(encoding="utf-8")
+    Path("/etc/harness-probe").write_text("x")
 except OSError:
     pass
 else:
-    raise RuntimeError("sandbox can read outside the task workspace")
-
+    raise SystemExit("root filesystem is writable")
 try:
-    protected.write_text("changed", encoding="utf-8")
+    socket.create_connection(("1.1.1.1", 53), timeout=2)
 except OSError:
     pass
 else:
-    raise RuntimeError("sandbox can write outside the task workspace")
-
-try:
-    with socket.socket() as connection:
-        connection.bind(("127.0.0.1", 0))
-except OSError:
-    pass
-else:
-    raise RuntimeError("sandbox network access is not blocked")
+    raise SystemExit("network is reachable")
 """
-
-    def _run_process(
-        self,
-        command: Sequence[str],
-        workspace: Path,
-        environment: Mapping[str, str],
-        timeout_seconds: float,
-    ) -> CheckResult:
-        started = time.monotonic()
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=workspace,
-                env=dict(environment),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
-        except OSError as error:
-            return CheckResult(
-                check_name="",
-                exit_code=None,
-                stdout="",
-                stderr="",
-                stdout_truncated=False,
-                stderr_truncated=False,
-                error=str(error),
-                duration_seconds=time.monotonic() - started,
-            )
-
-        stdout = _BoundedStream(process.stdout, self._output_limit_bytes)
-        stderr = _BoundedStream(process.stderr, self._output_limit_bytes)
-        readers = [
-            threading.Thread(target=stdout.drain, daemon=True),
-            threading.Thread(target=stderr.drain, daemon=True),
-        ]
-        for reader in readers:
-            reader.start()
-        timed_out = False
-        try:
-            try:
-                process.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-            except KeyboardInterrupt:
-                self._stop_process_group(process)
-                raise
-            self._stop_process_group(process)
-        finally:
-            for reader in readers:
-                reader.join()
-            process.stdout.close()
-            process.stderr.close()
-
-        return CheckResult(
-            check_name="",
-            exit_code=process.returncode,
-            stdout=stdout.text,
-            stderr=stderr.text,
-            stdout_truncated=stdout.truncated,
-            stderr_truncated=stderr.truncated,
-            timed_out=timed_out,
-            duration_seconds=time.monotonic() - started,
-        )
-
-    @staticmethod
-    def _stop_process_group(process: subprocess.Popen) -> None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            process.wait()
-            return
-        try:
-            process.wait(timeout=0.5)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-        else:
-            time.sleep(0.1)
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-
-    @staticmethod
-    def _resolve_command(command: Sequence[str]) -> tuple[str, ...]:
-        executable = command[0]
-        resolved = shutil.which(executable)
-        if resolved is None:
-            raise ValueError(f"Configured check executable was not found: {executable}")
-        return (str(Path(resolved).resolve()), *command[1:])
-
-    @staticmethod
-    def _process_error(result: CheckResult) -> str:
-        details = result.error or result.stderr.strip() or result.stdout.strip()
-        if result.timed_out:
-            details = f"Sandbox verification timed out. {details}"
-        if result.exit_code is not None:
-            details = f"Sandbox verification exited with code {result.exit_code}. {details}"
-        return details
-
-    @staticmethod
-    def _blocked(
-        check_name: str,
-        error: str,
-        started: float,
-        *,
-        stdout: str = "",
-        stderr: str = "",
-    ) -> CheckResult:
-        return CheckResult(
-            check_name=check_name,
-            exit_code=None,
-            stdout=stdout,
-            stderr=stderr,
-            stdout_truncated=False,
-            stderr_truncated=False,
-            blocked=True,
-            error=error,
-            duration_seconds=time.monotonic() - started,
-        )
-
-
-def _sbpl_quote(value: str) -> str:
-    if "\x00" in value:
-        raise ValueError("Sandbox paths cannot contain NUL bytes.")
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
-    return f'"{escaped}"'
