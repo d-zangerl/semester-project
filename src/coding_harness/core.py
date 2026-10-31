@@ -147,7 +147,9 @@ class TaskCore:
 
     def __init__(self, *, model_client=None, projects: Mapping[str, Project] | None = None,
                  state_directory: str | Path | None = None, runner=None, task_log_directory: str | Path | None = None,
-                 limits: RunLimits | None = None, context_limits: ContextLimits | None = None):
+                 limits: RunLimits | None = None, context_limits: ContextLimits | None = None,
+                 question_empty_completion: bool = True):
+        self.question_empty_completion = question_empty_completion
         self.context_limits = context_limits
         self.model_client = model_client
         self.projects = dict(projects or {})
@@ -212,6 +214,7 @@ class TaskCore:
             recorder=recorder,
             cancel_requested=lambda: self.store.cancel_requested(task_id),
             context_builder=context.build,
+            question_empty_completion=self.question_empty_completion,
         )
         finished = threading.Event()
 

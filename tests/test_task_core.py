@@ -77,6 +77,7 @@ class CoreTestCase(unittest.TestCase):
         return Project(**settings)
 
     def core(self, model=None, projects=None, **options):
+        options.setdefault("question_empty_completion", False)
         return TaskCore(model_client=model or ScriptedModel(), projects=projects or {"demo": self.project()},
                         state_directory=self.root / "state", runner=self.runner, **options)
 
@@ -280,6 +281,25 @@ class FixLoopTests(CoreTestCase):
         task = self.core(ScriptedModel(tool("list"), final("No change is needed."))).start("demo", "Inspect")
 
         self.assertEqual(task.result.outcome, "completed")
+
+    def test_a_completion_claim_with_no_changes_is_sent_back_once(self):
+        model = ScriptedModel(tool("list"), final("All done."), edit("note.txt", "new\n"), final("Really done."))
+
+        task = self.core(model, question_empty_completion=True).start("demo", "Update the note")
+
+        self.assertEqual(task.result.outcome, "completed")
+        self.assertEqual(task.result.final_response, "Really done.")
+        self.assertIn("no files have changed", model.requests[2][-1]["content"])
+        self.assertEqual(task.result.counters.denied_actions, 0)
+        self.assertEqual(task.result.counters.fix_attempts, 0)
+
+    def test_repeating_a_no_change_claim_is_settled_by_the_checks(self):
+        model = ScriptedModel(tool("list"), final("Nothing to do."), final("Nothing to do, really."))
+
+        task = self.core(model, question_empty_completion=True).start("demo", "Inspect")
+
+        self.assertEqual(task.result.outcome, "completed")
+        self.assertEqual(task.result.verification.changed_files, ())
 
     def test_a_final_reply_before_any_tool_use_is_denied_once(self):
         model = ScriptedModel(final("Immediately done."), tool("list"), final())

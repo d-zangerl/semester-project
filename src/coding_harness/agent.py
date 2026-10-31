@@ -77,7 +77,9 @@ class AgentController:
     def __init__(self, model_client, repository_tools, verification, *, limits: RunLimits | None = None,
                  progress: Callable[[str], None] | None = None, task_log_directory: str | Path | None = None,
                  recorder=None, cancel_requested: Callable[[], bool] | None = None,
-                 context_builder: Callable[[list[dict]], list[dict]] | None = None):
+                 context_builder: Callable[[list[dict]], list[dict]] | None = None,
+                 question_empty_completion: bool = False):
+        self.question_empty_completion = question_empty_completion
         self.model_client = model_client
         self.repository_tools = repository_tools
         self.verification = verification
@@ -236,6 +238,7 @@ class AgentController:
         """Returns final response, stop reason, latest verification, and task outcome."""
         verification = None
         premature_final_denied = counters.actions > 0
+        empty_completion_questioned = not self.question_empty_completion
         while True:
             if counters.responses >= self.limits.responses:
                 stopped = f"Model response limit reached ({self.limits.responses})."
@@ -292,6 +295,14 @@ class AgentController:
                                 "search, read, or edit tools first, then send a final response describing what you actually did."))
                             continue
                         counters.consecutive_retries = 0
+                        if not empty_completion_questioned and not self.verification.diff(workspace, baseline)[0]:
+                            empty_completion_questioned = True
+                            self._emit_progress("Completion claimed, but no files have changed; asking the model to check.")
+                            self._append(messages, "user", (
+                                "You claimed completion, but no files have changed. If the task asks for a change, use "
+                                "search, find_symbol, and read to locate the code, then make the edit. Repeat your final "
+                                "response only if the task really requires no change."))
+                            continue
                         self._log_event(f"Model response {counters.responses} accepted as a final response.")
                         self._emit_progress("Model completed; running configured verification checks.")
                         try:

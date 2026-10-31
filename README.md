@@ -126,7 +126,7 @@ flowchart TD
 
 **Limits per task, kept across runs.** 60 tool actions, 80 model responses, 3 consecutive invalid replies or denied actions, 3 fix attempts, and 200,000 tokens. Tokens use the service's usage figures, and a missing figure is an estimate that is labelled as one.
 
-**Stopping rule.** A task ends as completed (every check passes), failed (a limit was reached, or checks are failing or unavailable), cancelled, or paused. A model's completion claim is never enough on its own. An outage or rejected key pauses the task and uses no fix attempts.
+**Stopping rule.** A task ends as completed (every check passes), failed (a limit was reached, or checks are failing or unavailable), cancelled, or paused. A model's completion claim is never enough on its own, and a claim with no changed files is sent back once. "Completed" means the configured checks pass; it does not prove the requested feature works, which is what task-specific acceptance checks are for. An outage or rejected key pauses the task and uses no fix attempts.
 
 **Checkpoints.** For each tool action, the harness saves a `started` record, runs the action, then saves a `finished` record with the result and a workspace hash, and commits changes to the task's private Git history.
 
