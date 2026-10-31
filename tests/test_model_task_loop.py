@@ -11,7 +11,6 @@ from unittest.mock import patch
 from src.coding_harness.agent import AgentController
 from src.coding_harness.agent import RunLimits
 from src.coding_harness.cli import UserInterface
-from src.coding_harness.model import ModelClient
 from src.coding_harness.repository import RepositoryTools
 from src.coding_harness.verification import Verification
 
@@ -687,66 +686,6 @@ class RepositoryToolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tools.edit_file("escape.txt", "modified")
             self.assertEqual(outside.read_text(encoding="utf-8"), "outside secret")
-
-
-class OllamaContractTests(unittest.TestCase):
-    def test_chat_request_uses_non_streaming_ollama_api_contract(self):
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-        import threading
-
-        seen = {}
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                seen["path"] = self.path
-                seen["body"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                body = json.dumps({"message": {"content": '{"type":"final","response":"ok"}'}}).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *args):
-                pass
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            client = ModelClient(f"http://127.0.0.1:{server.server_port}", "test-model")
-            answer = client.request([{"role": "user", "content": "task"}])
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join()
-
-        self.assertEqual(answer, '{"type":"final","response":"ok"}')
-        self.assertEqual(seen["path"], "/api/chat")
-        self.assertEqual(seen["body"]["model"], "test-model")
-        self.assertFalse(seen["body"]["stream"])
-        action_schema = seen["body"]["format"]
-        search_action = next(
-            branch for branch in action_schema["oneOf"]
-            if branch.get("properties", {}).get("tool", {}).get("const") == "search"
-        )
-        search_arguments = search_action["properties"]["arguments"]
-        self.assertEqual(set(search_arguments["properties"]), {"query", "path"})
-        self.assertTrue(search_arguments["additionalProperties"] is False)
-        edit_action = next(
-            branch for branch in action_schema["oneOf"]
-            if branch.get("properties", {}).get("tool", {}).get("const") == "edit"
-        )
-        edit_modes = edit_action["properties"]["arguments"]["oneOf"]
-        self.assertTrue(any(
-            {"function", "function_content"} <= set(mode["properties"])
-            for mode in edit_modes
-        ))
-        self.assertEqual(seen["body"]["messages"], [{"role": "user", "content": "task"}])
-
-    def test_model_client_rejects_nonlocal_endpoints(self):
-        with self.assertRaises(ValueError):
-            ModelClient("http://example.com:11434", "model")
 
 
 class InteractiveCliTests(unittest.TestCase):

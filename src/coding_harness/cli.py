@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .core import TaskCore
 from .execution import ExecutionEnvironment
-from .model import ModelClient
+from .model import ModelClient, client_from_environment
 from .review import apply_changes, target_mismatches
 from .verification import Verification
 from .workspace import create_task_workspace
@@ -170,10 +170,7 @@ class UserInterface:
 
     @staticmethod
     def _model_client() -> ModelClient:
-        endpoint = os.environ.get("CODING_HARNESS_OLLAMA_ENDPOINT", "http://localhost:11434")
-        model = os.environ.get("CODING_HARNESS_OLLAMA_MODEL", "qwen2.5-coder:7b")
-        timeout = float(os.environ.get("CODING_HARNESS_OLLAMA_TIMEOUT", "300"))
-        return ModelClient(endpoint, model, timeout_seconds=timeout)
+        return client_from_environment()
 
     @staticmethod
     def _show_help() -> None:

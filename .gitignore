@@ -1,3 +1,9 @@
 coding-harness-task-*.log
 demo-record-*.md
 src/coding_harness/__pycache__/*
+.env
+.venv/
+.harness/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
