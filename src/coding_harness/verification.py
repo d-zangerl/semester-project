@@ -4,6 +4,7 @@ import difflib
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .execution import CheckResult
 
@@ -21,9 +22,11 @@ class VerificationResult:
 
 
 class Verification:
-    def __init__(self, execution_environment, *, diff_limit_bytes: int = 64 * 1024):
+    def __init__(self, execution_environment, *, diff_limit_bytes: int = 64 * 1024,
+                 relevant: Callable[[str], bool] | None = None):
         self.execution_environment = execution_environment
         self.diff_limit_bytes = diff_limit_bytes
+        self.relevant = relevant or (lambda name: True)
 
     def capture_baseline(self, workspace: str | Path) -> dict[str, bytes]:
         root = Path(workspace).resolve()
@@ -37,33 +40,34 @@ class Verification:
         return baseline
 
     def diff(self, workspace: str | Path, baseline: dict[str, bytes]) -> tuple[tuple[str, ...], str, bool]:
-        changes, diff, truncated = self._diff(baseline, Path(workspace).resolve(), self.diff_limit_bytes)
+        changes, diff, truncated = self._diff(baseline, Path(workspace).resolve(), self.diff_limit_bytes, self.relevant)
         return tuple(changes), diff, truncated
 
     def verify(self, workspace: str | Path, baseline: dict[str, bytes]) -> VerificationResult:
         workspace_path = Path(workspace).resolve()
-        changes, diff, truncated = self._diff(baseline, workspace_path, self.diff_limit_bytes)
-        names = self._check_names()
+        changes, diff, truncated = self._diff(baseline, workspace_path, self.diff_limit_bytes, self.relevant)
+        names = self.check_names()
         if not names:
             checks = (CheckResult("configured checks", None, "", "", False, False,
                                   blocked=True, error="No configured repository checks are available."),)
         else:
-            outcomes = []
-            for name in names:
-                try:
-                    outcomes.append(self.execution_environment.run_check(name, workspace_path))
-                except Exception as error:
-                    outcomes.append(CheckResult(name, None, "", "", False, False,
-                                                blocked=True, error=f"Configured check unavailable: {error}"))
-            checks = tuple(outcomes)
+            checks = tuple(self.run_check(name, workspace_path) for name in names)
         return VerificationResult(checks, tuple(changes), diff, truncated)
 
-    def _check_names(self) -> tuple[str, ...]:
+    def check_names(self) -> tuple[str, ...]:
         names = getattr(self.execution_environment, "check_names", ("core",))
         return tuple(names)
 
+    def run_check(self, name: str, workspace: str | Path) -> CheckResult:
+        try:
+            return self.execution_environment.run_check(name, Path(workspace).resolve())
+        except Exception as error:
+            return CheckResult(name, None, "", "", False, False, blocked=True,
+                               error=f"Configured check unavailable: {error}")
+
     @staticmethod
-    def _diff(baseline: dict[str, bytes], workspace: Path, byte_limit: int) -> tuple[list[str], str, bool]:
+    def _diff(baseline: dict[str, bytes], workspace: Path, byte_limit: int,
+              relevant: Callable[[str], bool] = lambda name: True) -> tuple[list[str], str, bool]:
         changes = []
         chunks = []
         size = 0
@@ -71,7 +75,7 @@ class Verification:
         workspace_files = {p.relative_to(workspace).as_posix(): p for p in workspace.rglob("*")
                            if p.is_file() and not p.is_symlink() and ".git" not in p.parts
                            and not any(part.startswith(".harness-") for part in p.relative_to(workspace).parts)}
-        for name in sorted(baseline.keys() | workspace_files.keys()):
+        for name in sorted(name for name in baseline.keys() | workspace_files.keys() if relevant(name)):
             after = workspace_files.get(name)
             old = baseline.get(name, b"")
             new = after.read_bytes() if after else b""

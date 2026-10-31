@@ -44,6 +44,7 @@ ACTION_SCHEMA = {
             "required": ["type", "response"],
             "additionalProperties": False,
         },
+        _tool_action_schema("check", _argument_schema({"name": {"type": "string"}}, ["name"])),
         _tool_action_schema("list", _argument_schema({"path": {"type": "string"}}, [])),
         _tool_action_schema("read", _argument_schema({
             "path": {"type": "string"},

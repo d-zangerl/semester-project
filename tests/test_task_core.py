@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from src.coding_harness.agent import RunLimits
 from src.coding_harness.core import TaskCore, UnknownProjectError
 from src.coding_harness.projects import Project
 from tests.fakes import LocalRunner
@@ -22,8 +23,8 @@ class ScriptedModel:
         return reply
 
 
-def tool(name, **arguments):
-    return json.dumps({"type": "tool", "tool": name, "arguments": arguments})
+def tool(tool_name, /, **arguments):
+    return json.dumps({"type": "tool", "tool": tool_name, "arguments": arguments})
 
 
 def edit(path, content):
@@ -137,6 +138,180 @@ class AllowedProjectTests(CoreTestCase):
         self.core(ScriptedModel(tool("list"), final())).start("demo", "Inspect", progress=seen.append)
 
         self.assertTrue(any("Tool action" in message for message in seen))
+
+
+class FailingThenPassingCheck:
+    """A check script that passes only once the note says 'fixed'."""
+    SOURCE = ("from pathlib import Path\n"
+              "import sys\n"
+              "print('note is', Path('note.txt').read_text().strip())\n"
+              "sys.exit(0 if 'fixed' in Path('note.txt').read_text() else 3)\n")
+
+
+class SavedTaskTests(CoreTestCase):
+    def test_a_restarted_core_reopens_details_steps_history_errors_and_check_results(self):
+        model = ScriptedModel(edit("other.py", "denied"), edit("note.txt", "new\n"), final("All done."))
+        task = self.core(model).start("demo", "Update the note")
+
+        saved = self.core().show(task.task_id)
+
+        self.assertEqual(saved.request, "Update the note")
+        self.assertEqual(saved.project, "demo")
+        self.assertEqual(saved.start_commit, self.start_commit)
+        self.assertEqual(saved.allowed_changes, ("note.txt", "tests/**"))
+        self.assertEqual(saved.check_names, ("core",))
+        self.assertEqual(saved.state, "completed")
+        self.assertEqual(saved.final_response, "All done.")
+        self.assertEqual([step.tool for step in saved.steps], ["edit", "edit"])
+        self.assertIn("allowed changes", saved.steps[0].result)
+        self.assertTrue(saved.steps[0].denied)
+        self.assertIn("allowed changes", " ".join(saved.errors))
+        self.assertTrue(any("Update the note" in message["content"] for message in saved.history))
+        self.assertEqual([(check.check_name, check.passed) for check in saved.checks], [("core", True)])
+        self.assertEqual(saved.counters.actions, 1)
+        self.assertEqual(saved.changed_files, ("note.txt",))
+        self.assertIn("+new", saved.diff)
+
+    def test_tasks_are_listed_with_their_states(self):
+        first = self.core(ScriptedModel(tool("list"), final())).start("demo", "First")
+        second = self.core(ScriptedModel(StopIteration())).start("demo", "Second")
+
+        listed = {task.task_id: task.state for task in self.core().list_tasks()}
+
+        self.assertEqual(listed[first.task_id], "completed")
+        self.assertEqual(listed[second.task_id], "failed")
+
+    def test_saved_state_is_visible_while_a_run_is_active(self):
+        seen = []
+        observer = self.core()
+
+        def observe(message):
+            if message.startswith("Tool action"):
+                seen.append(observer.list_tasks()[0])
+
+        self.core(ScriptedModel(tool("list"), final())).start("demo", "Watch me", progress=observe)
+
+        self.assertEqual(seen[0].state, "running")
+        self.assertEqual(len(observer.show(seen[0].task_id).steps), 1)
+
+    def test_the_starting_state_for_diffs_survives_a_restart(self):
+        task = self.core(ScriptedModel(edit("note.txt", "new\n"), StopIteration())).start("demo", "Edit")
+
+        saved = self.core().show(task.task_id)
+
+        self.assertEqual(saved.changed_files, ("note.txt",))
+        self.assertIn("-old", saved.diff)
+
+    def test_saved_state_contains_no_api_key(self):
+        class KeyedModel(ScriptedModel):
+            _api_key = "sk-do-not-store"
+
+        self.core(KeyedModel(tool("list"), final())).start("demo", "Inspect")
+
+        for path in (self.root / "state").rglob("*"):
+            if path.is_file():
+                self.assertNotIn(b"sk-do-not-store", path.read_bytes(), path)
+
+
+class FixLoopTests(CoreTestCase):
+    def fixable_project(self):
+        (self.repository / "tests" / "check.py").write_text(FailingThenPassingCheck.SOURCE, encoding="utf-8")
+        git(self.repository, "add", ".")
+        git(self.repository, "commit", "-qm", "check")
+        return {"demo": self.project()}
+
+    def test_a_failed_check_after_a_completion_claim_guides_a_fix(self):
+        model = ScriptedModel(edit("note.txt", "wrong\n"), final("Finished."), edit("note.txt", "fixed\n"), final("Now fixed."))
+
+        task = self.core(model, self.fixable_project()).start("demo", "Fix the note")
+
+        self.assertEqual(task.result.outcome, "completed")
+        self.assertEqual(task.result.counters.fix_attempts, 1)
+        feedback = model.requests[2][-1]["content"]
+        self.assertIn("note is wrong", feedback)
+        self.assertIn("untrusted", feedback.lower())
+        self.assertEqual(task.result.final_response, "Now fixed.")
+
+    def test_the_model_can_run_a_configured_check_mid_task(self):
+        model = ScriptedModel(tool("check", name="core"), edit("note.txt", "fixed\n"), final())
+
+        task = self.core(model, self.fixable_project()).start("demo", "Fix the note")
+
+        self.assertIn("note is old", model.requests[1][-1]["content"])
+        self.assertEqual(task.result.outcome, "completed")
+        self.assertEqual(task.result.counters.fix_attempts, 0)
+
+    def test_the_model_cannot_name_an_unconfigured_check(self):
+        model = ScriptedModel(tool("check", name="rm -rf /"), tool("list"), final())
+
+        task = self.core(model).start("demo", "Try it")
+
+        self.assertEqual(task.result.counters.denied_actions, 1)
+        self.assertFalse(any("rm -rf" in " ".join(spec.command) for spec in self.runner.specs))
+
+    def test_running_out_of_fix_attempts_fails_the_task_with_the_failure_visible(self):
+        replies = [edit("note.txt", "wrong\n")] + [final("Claimed.")] * 4
+        task = self.core(ScriptedModel(*replies), self.fixable_project()).start("demo", "Fix the note")
+
+        self.assertEqual(task.result.outcome, "failed")
+        self.assertEqual(task.result.counters.fix_attempts, 3)
+        self.assertIn("Fix attempt limit", task.result.stopped_reason)
+        self.assertFalse(task.result.verification.checks[0].passed)
+        self.assertEqual([c.passed for c in self.core().show(task.task_id).checks], [False])
+
+    def test_unavailable_checks_fail_the_task_and_never_appear_as_passed(self):
+        self.runner.unavailable = "Docker daemon is not running."
+
+        task = self.core(ScriptedModel(tool("list"), final())).start("demo", "Inspect")
+
+        self.assertEqual(task.result.outcome, "failed")
+        check = self.core().show(task.task_id).checks[0]
+        self.assertFalse(check.passed)
+        self.assertTrue(check.blocked)
+        self.assertEqual(task.result.counters.fix_attempts, 0)
+
+    def test_a_claim_of_no_change_needed_is_settled_by_the_checks(self):
+        task = self.core(ScriptedModel(tool("list"), final("No change is needed."))).start("demo", "Inspect")
+
+        self.assertEqual(task.result.outcome, "completed")
+
+    def test_a_final_reply_before_any_tool_use_is_denied_once(self):
+        model = ScriptedModel(final("Immediately done."), tool("list"), final())
+
+        task = self.core(model).start("demo", "Inspect")
+
+        self.assertEqual(task.result.counters.denied_actions, 1)
+        self.assertEqual(task.result.outcome, "completed")
+
+    def test_each_limit_stops_the_task_visibly(self):
+        cases = [
+            ("actions", RunLimits(actions=1), [tool("list"), tool("list"), final()], "Tool action limit"),
+            ("responses", RunLimits(responses=1), [tool("list"), final()], "response limit"),
+            ("retries", RunLimits(retries=2), ["junk", "junk", final()], "Retry limit"),
+            ("tokens", RunLimits(tokens=1), [tool("list"), final()], "Token limit"),
+        ]
+        for name, limits, replies, message in cases:
+            with self.subTest(name):
+                task = self.core(ScriptedModel(*replies), limits=limits).start("demo", "Inspect")
+
+                self.assertEqual(task.result.outcome, "failed")
+                self.assertIn(message, task.result.stopped_reason)
+
+    def test_valid_replies_reset_consecutive_retries_while_denied_actions_count_toward_them(self):
+        replies = ["junk", tool("list"), "junk", tool("list"), final()]
+        task = self.core(ScriptedModel(*replies), limits=RunLimits(retries=2)).start("demo", "Inspect")
+        self.assertEqual(task.result.outcome, "completed")
+
+        denied = [edit("nope.py", "x"), edit("nope.py", "x"), final()]
+        task = self.core(ScriptedModel(*denied), limits=RunLimits(retries=2)).start("demo", "Inspect")
+        self.assertIn("Retry limit", task.result.stopped_reason)
+        self.assertEqual(task.result.counters.actions, 0)
+
+    def test_default_limits_match_the_documented_values(self):
+        limits = RunLimits()
+
+        self.assertEqual((limits.actions, limits.responses, limits.retries, limits.fix_attempts, limits.tokens),
+                         (60, 80, 3, 3, 200_000))
 
 
 if __name__ == "__main__":
