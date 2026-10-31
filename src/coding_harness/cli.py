@@ -6,10 +6,9 @@ import shutil
 import sys
 from pathlib import Path
 
-from .agent import AgentController
+from .core import TaskCore
 from .execution import ExecutionEnvironment
 from .model import ModelClient
-from .repository import RepositoryTools
 from .review import apply_changes, target_mismatches
 from .verification import Verification
 from .workspace import create_task_workspace
@@ -58,18 +57,11 @@ class UserInterface:
                 continue
             if not task:
                 continue
+            core = TaskCore(model_client=model, environment_factory=self.execution_environment_factory,
+                            workspace_factory=self.workspace_factory, task_log_directory=project_root)
             try:
-                workspace = self.workspace_factory(repository)
-                print(f"Task workspace: {workspace}")
-                environment = self.execution_environment_factory()
-                controller = AgentController(
-                    model,
-                    RepositoryTools(workspace),
-                    Verification(environment),
-                    progress=lambda message: print(f"[progress] {message}"),
-                    task_log_directory=project_root,
-                )
-                result = controller.run_task(task, workspace)
+                started = core.start(repository, task, progress=lambda message: print(f"[progress] {message}"))
+                result, workspace, environment = started.result, started.workspace, started.environment
             except KeyboardInterrupt:
                 print("\nTask interrupted; workspace retained for diagnosis.")
                 return 130
