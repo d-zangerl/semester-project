@@ -10,9 +10,11 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from .agent import AgentController, RunCounters, RunLimits, TaskResult
+from .context import ContextLimits, ContextManager
 from .execution import CheckResult, ExecutionEnvironment
 from .projects import Project, path_matches
 from .repository import RepositoryTools
+from .model import estimate_tokens
 from .store import TaskStore
 from .verification import Verification
 from .workspace import WorkspaceRepository, create_project_workspace, create_task_workspace
@@ -115,7 +117,8 @@ class TaskCore:
     def __init__(self, *, model_client=None, projects: Mapping[str, Project] | None = None,
                  state_directory: str | Path | None = None, runner=None, environment_factory=ExecutionEnvironment,
                  workspace_factory=create_task_workspace, task_log_directory: str | Path | None = None,
-                 limits: RunLimits | None = None):
+                 limits: RunLimits | None = None, context_limits: ContextLimits | None = None):
+        self.context_limits = context_limits
         self.model_client = model_client
         self.projects = dict(projects or {})
         self.state_directory = Path(state_directory).resolve() if state_directory else Path(".harness").resolve()
@@ -145,16 +148,21 @@ class TaskCore:
         if not isinstance(request, str) or not request.strip():
             raise ValueError("Task description is required.")
         emit = progress or (lambda message: None)
+        trusted = self._trusted_messages(project, request)
+        limit = (self.context_limits or ContextLimits()).trusted
+        if sum(estimate_tokens(message["content"]) for message in trusted) > limit:
+            raise ValueError(f"The request is too long: trusted terms must fit within {limit} estimated tokens.")
         task_id = uuid.uuid4().hex[:8]
         workspace, commit, repository, first_commit = create_project_workspace(
             project, self.state_directory / "workspaces" / task_id, self.state_directory / "git" / task_id)
         self.store.create_task(task_id, project.name, request, commit, first_commit, workspace,
                                repository.git_directory, project.settings(), dataclasses.asdict(self.limits))
         emit(f"Task {task_id} workspace: {workspace}")
-        return self._run(task_id, project, repository, emit)
+        return self._run(task_id, project, repository, emit, initial_messages=trusted)
 
     def _run(self, task_id: str, project: Project, repository: WorkspaceRepository, emit,
-             counters: RunCounters | None = None, history: list[dict] | None = None) -> StartedTask:
+             counters: RunCounters | None = None, history: list[dict] | None = None,
+             initial_messages: list[dict] | None = None) -> StartedTask:
         saved = self.store.task(task_id)
         workspace = repository.workspace
         limits = RunLimits(**json.loads(saved["limits"]))
@@ -162,19 +170,30 @@ class TaskCore:
         environment = ExecutionEnvironment(checks=project.checks, runner=self.runner, run_id=f"{task_id}-{run_id}")
         recorder = _StoreRecorder(self.store, repository, task_id, run_id)
         recorder._hash = hash_workspace(workspace)
+        tools = RepositoryTools(workspace, allowed_changes=project.allowed_changes, history=repository)
+        context = ContextManager(tools, saved["request"], lambda: self.store.actions(task_id), self.context_limits)
         controller = AgentController(
             self.model_client,
-            RepositoryTools(workspace, allowed_changes=project.allowed_changes),
+            tools,
             self._verification(environment, project.allowed_changes),
             limits=limits,
             progress=emit,
             task_log_directory=self.task_log_directory,
             recorder=recorder,
+            context_builder=context.build,
         )
         result = controller.run_task(saved["request"], workspace, baseline=repository.files_at(saved["first_commit"]),
-                                     counters=counters, history=history)
+                                     counters=counters, history=history, initial_messages=initial_messages)
         self._save_result(task_id, run_id, result)
         return StartedTask(result, workspace, environment, task_id, saved["start_commit"], repository)
+
+    @staticmethod
+    def _trusted_messages(project: Project, request: str) -> list[dict]:
+        terms = (f"Task: {request.strip()}\n"
+                 f"Scope: you may only change these paths: {', '.join(project.allowed_changes)}.\n"
+                 f"Acceptance: the task is complete only when these configured checks pass: "
+                 f"{', '.join(project.checks) or '(none)'}.")
+        return [{"role": "system", "content": AgentController._system_prompt()}, {"role": "user", "content": terms}]
 
     @staticmethod
     def _verification(environment, allowed_changes) -> Verification:

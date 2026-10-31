@@ -17,16 +17,19 @@ class RepositoryTools:
     _excluded_suffixes = {".pyc", ".sqlite", ".db", ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip"}
 
     def __init__(self, workspace: str | Path, *, max_file_bytes: int = 256 * 1024, max_results: int = 200,
-                 read_window_lines: int = 200, allowed_changes: tuple[str, ...] | None = None):
+                 read_window_lines: int = 200, allowed_changes: tuple[str, ...] | None = None,
+                 history=None):
         self.workspace = Path(workspace).resolve(strict=True)
         self.allowed_changes = allowed_changes
+        self.history = history
         self.max_file_bytes = max_file_bytes
         self.read_window_lines = read_window_lines
         self.max_results = max_results
 
     def for_workspace(self, workspace: str | Path) -> "RepositoryTools":
         return RepositoryTools(workspace, max_file_bytes=self.max_file_bytes, max_results=self.max_results,
-                               read_window_lines=self.read_window_lines, allowed_changes=self.allowed_changes)
+                               read_window_lines=self.read_window_lines, allowed_changes=self.allowed_changes,
+                               history=self.history)
 
     def list_files(self, path: str = ".") -> dict:
         directory = self._resolve(path)
@@ -95,6 +98,99 @@ class RepositoryTools:
             except (OSError, UnicodeDecodeError):
                 continue
         return {"matches": matches, "truncated": False}
+
+    def python_files(self) -> list[Path]:
+        return sorted(item for item in self.workspace.rglob("*.py")
+                      if item.is_file() and not self._excluded(item) and item.stat().st_size <= self.max_file_bytes)
+
+    def _parsed_python_files(self) -> tuple[list[tuple[str, ast.Module]], list[str]]:
+        parsed, unparsable = [], []
+        for file in self.python_files():
+            relative = file.relative_to(self.workspace).as_posix()
+            try:
+                parsed.append((relative, ast.parse(file.read_bytes(), filename=relative)))
+            except (SyntaxError, ValueError, OSError):
+                unparsable.append(relative)
+        return parsed, unparsable
+
+    def find_symbol(self, name: str) -> dict:
+        if not isinstance(name, str) or not name.isidentifier():
+            raise ValueError("Symbol name must be a Python identifier.")
+        definitions, references = [], []
+        parsed, unparsable = self._parsed_python_files()
+        for relative, tree in parsed:
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                    definitions.append({"path": relative, "line": node.lineno, "kind": "function"})
+                elif isinstance(node, ast.ClassDef) and node.name == name:
+                    definitions.append({"path": relative, "line": node.lineno, "kind": "class"})
+                elif isinstance(node, ast.Name) and node.id == name:
+                    kind = "variable" if isinstance(node.ctx, ast.Store) else None
+                    (definitions.append({"path": relative, "line": node.lineno, "kind": kind}) if kind
+                     else references.append({"path": relative, "line": node.lineno}))
+                elif isinstance(node, ast.Attribute) and node.attr == name:
+                    references.append({"path": relative, "line": node.lineno})
+                elif isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+                        (alias.asname or alias.name).split(".")[-1] == name or alias.name == name for alias in node.names):
+                    references.append({"path": relative, "line": node.lineno})
+        truncated = len(definitions) > self.max_results or len(references) > self.max_results
+        return {"definitions": definitions[:self.max_results], "references": references[:self.max_results],
+                "unparsable": unparsable[:self.max_results], "truncated": truncated}
+
+    def _module_paths(self) -> dict[str, str]:
+        modules = {}
+        for file in self.python_files():
+            relative = file.relative_to(self.workspace)
+            parts = relative.with_suffix("").parts
+            parts = parts[:-1] if parts[-1] == "__init__" else parts
+            if parts:
+                modules[".".join(parts)] = relative.as_posix()
+        return modules
+
+    @staticmethod
+    def _imported_names(tree: ast.Module, relative: str) -> set[str]:
+        package = Path(relative).parent.parts
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                base = tuple((node.module or "").split(".")) if node.module else ()
+                if node.level:
+                    keep = len(package) - (node.level - 1)
+                    base = (*package[:max(keep, 0)], *base)
+                names.add(".".join(base))
+                names.update(".".join((*base, alias.name)) for alias in node.names)
+        return names
+
+    def dependencies(self, path: str) -> dict:
+        file = self._resolve(path)
+        if not file.is_file() or self._excluded(file) or file.suffix != ".py":
+            raise ValueError("Dependencies path must identify an allowed Python file.")
+        target = file.relative_to(self.workspace).as_posix()
+        modules = self._module_paths()
+        parsed, unparsable = self._parsed_python_files()
+        imports, imported_by = set(), set()
+        for relative, tree in parsed:
+            resolved = {modules[name] for name in self._imported_names(tree, relative) if name in modules} - {relative}
+            if relative == target:
+                imports = resolved
+            elif target in resolved:
+                imported_by.add(relative)
+        return {"path": target, "imports": sorted(imports)[:self.max_results],
+                "imported_by": sorted(imported_by)[:self.max_results],
+                "unparsable": unparsable[:self.max_results]}
+
+    def git_status(self) -> dict:
+        if self.history is None:
+            raise ValueError("Git state is not available for this task.")
+        changes = [{"status": status, "path": path} for status, path in self.history.changes_since_start()]
+        return {"changes": changes[:self.max_results], "truncated": len(changes) > self.max_results}
+
+    def git_diff(self) -> dict:
+        if self.history is None:
+            raise ValueError("Git state is not available for this task.")
+        return {"diff": self.history.diff_since_start()}
 
     def edit_file(self, path: str, content: str) -> dict:
         file = self._resolve(path, allow_missing=True)

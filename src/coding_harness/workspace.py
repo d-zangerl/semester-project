@@ -127,11 +127,15 @@ class WorkspaceRepository:
         self._git("reset", "-q", "--hard", commit)
         self._git("clean", "-q", "-f", "-d", "-x")
 
-    def status(self) -> str:
-        return self._git("status", "--porcelain").stdout
+    def _first_commit(self) -> str:
+        return self._git("rev-list", "--max-parents=0", "HEAD").stdout.split()[0]
 
-    def diff(self, commit: str | None = None) -> str:
-        return self._git("diff", commit or "HEAD", "--", ".").stdout
+    def changes_since_start(self) -> list[tuple[str, str]]:
+        lines = self._git("diff", "--name-status", "--no-renames", self._first_commit(), "--", ".").stdout.splitlines()
+        return [(line.split("\t", 1)[0], line.split("\t", 1)[1]) for line in lines]
+
+    def diff_since_start(self) -> str:
+        return self._git("diff", "--no-ext-diff", self._first_commit(), "--", ".").stdout
 
     def files_at(self, commit: str) -> dict[str, bytes]:
         archive = self._git("archive", "--format=tar", commit, text=False).stdout

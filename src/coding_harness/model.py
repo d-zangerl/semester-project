@@ -44,6 +44,10 @@ ACTION_SCHEMA = {
             "required": ["type", "response"],
             "additionalProperties": False,
         },
+        _tool_action_schema("find_symbol", _argument_schema({"name": {"type": "string"}}, ["name"])),
+        _tool_action_schema("dependencies", _argument_schema({"path": {"type": "string"}}, ["path"])),
+        _tool_action_schema("git_status", _argument_schema({}, [])),
+        _tool_action_schema("git_diff", _argument_schema({}, [])),
         _tool_action_schema("check", _argument_schema({"name": {"type": "string"}}, ["name"])),
         _tool_action_schema("list", _argument_schema({"path": {"type": "string"}}, [])),
         _tool_action_schema("read", _argument_schema({
