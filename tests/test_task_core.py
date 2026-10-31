@@ -42,7 +42,7 @@ def final(text="Done."):
 
 
 def git(directory, *arguments):
-    return subprocess.run(["git", "-C", str(directory), "-c", "user.name=t", "-c", "user.email=t@example.com",
+    return subprocess.run(["git", "-C", str(directory), "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "core.autocrlf=false",
                            *arguments], check=True, capture_output=True, text=True).stdout.strip()
 
 
@@ -875,6 +875,87 @@ class ReviewTests(CoreTestCase):
 
         with self.assertRaises(ValueError):
             self.core().approve(task.task_id)
+
+
+class EditSafetyTests(CoreTestCase):
+    def edited(self, name, original, *replies):
+        (self.repository / name).write_bytes(original)
+        git(self.repository, "add", ".")
+        git(self.repository, "commit", "-qm", "fixture", "--allow-empty")
+        project = self.project(allowed_changes=(name,))
+        model = ScriptedModel(*replies, final())
+        task = self.core(model, {"demo": project}).start("demo", "Edit")
+        return (task.workspace / name).read_bytes(), task, model
+
+    def test_a_snippet_edit_keeps_the_rest_of_a_long_file(self):
+        original = "".join(f"line{n}\n" for n in range(1000)).encode()
+
+        result, _, _ = self.edited("big.py", original, tool("edit", path="big.py", old="line5\n", new="changed\n"))
+
+        self.assertEqual(result, original.replace(b"line5\n", b"changed\n", 1))
+
+    def test_a_snippet_past_the_read_window_can_be_edited_and_duplicates_there_are_seen(self):
+        original = "".join(f"line{n}\n" for n in range(1000)).encode() + b"line999\n"
+
+        result, _, _ = self.edited("big.py", original, tool("edit", path="big.py", old="line900\n", new="x\n"))
+        self.assertIn(b"\nx\n", result)
+
+        result, _, model = self.edited("big.py", original, tool("edit", path="big.py", old="line999\n", new="y\n"))
+        self.assertEqual(result, original)
+        self.assertIn("matches 2 times", model.requests[1][-1]["content"])
+
+    def test_edits_keep_windows_line_endings(self):
+        original = b"a = 1\r\nb = 2\r\nc = 3\r\n"
+        for reply, expected in (
+                (tool("edit", path="c.py", start_line=2, end_line=2, text="b = 9"), b"a = 1\r\nb = 9\r\nc = 3\r\n"),
+                (tool("edit", path="c.py", after_line=1, text="z = 0"), b"a = 1\r\nz = 0\r\nb = 2\r\nc = 3\r\n")):
+            with self.subTest(reply):
+                result, _, _ = self.edited("c.py", original, reply)
+                self.assertEqual(result, expected)
+
+    def test_replacing_a_function_is_not_misled_by_form_feeds(self):
+        original = b"# intro\n\x0c\n# section\ndef a():\n    return 1\n\ndef b():\n    return 2\n"
+
+        result, _, _ = self.edited("f.py", original, tool("edit", path="f.py", function="a",
+                                                          function_content="def a():\n    return 9"))
+
+        self.assertEqual(result, b"# intro\n\x0c\n# section\ndef a():\n    return 9\n\ndef b():\n    return 2\n")
+
+    def test_the_indentation_tolerant_edit_keeps_relative_indentation(self):
+        original = b"def f(x):\n    if x:\n        return 1\n    else:\n        return 2\n"
+
+        result, _, _ = self.edited("g.py", original, tool("edit", path="g.py", old="    return 1\nelse:\n    return 2",
+                                                          new="    return 7\nelse:\n    return 8"))
+
+        self.assertEqual(result, b"def f(x):\n    if x:\n        return 7\n    else:\n        return 8\n")
+
+    def test_a_pathologically_nested_function_is_denied_rather_than_aborting_the_task(self):
+        original = b"def f():\n    return 1\n"
+        hostile = "def f():\n    return a" + ".b" * 100000
+
+        result, task, _ = self.edited("h.py", original, tool("edit", path="h.py", function="f", function_content=hostile), tool("list"))
+
+        self.assertEqual(result, original)
+        self.assertEqual(task.result.counters.denied_actions, 1)
+        self.assertEqual(task.result.outcome, "completed")
+
+    def test_a_pathologically_nested_repository_file_does_not_break_navigation_or_context(self):
+        original = ("x = a" + ".b" * 100000 + "\n").encode()
+
+        _, task, model = self.edited("nested.py", original, tool("find_symbol", name="x"))
+
+        self.assertEqual(task.result.outcome, "completed")
+        self.assertIn("nested.py", model.requests[1][-1]["content"])
+
+    def test_a_stray_argument_from_another_edit_mode_is_denied(self):
+        original = b"a = 1\n"
+
+        for reply in (tool("edit", path="m.py", content="b = 2\n", text="ignored"),
+                      tool("edit", path="m.py", old="a", new="b", text="ignored")):
+            with self.subTest(reply):
+                result, task, _ = self.edited("m.py", original, reply, tool("list"))
+                self.assertEqual(result, original)
+                self.assertEqual(task.result.counters.denied_actions, 1)
 
 
 if __name__ == "__main__":

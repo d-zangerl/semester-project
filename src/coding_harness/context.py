@@ -51,7 +51,7 @@ class ContextManager:
             relative = file.relative_to(self.tools.workspace).as_posix()
             try:
                 tree = ast.parse(file.read_bytes())
-            except (SyntaxError, ValueError, OSError):
+            except (SyntaxError, ValueError, OSError, MemoryError, RecursionError):
                 lines.append(f"{relative}: (could not be parsed)")
                 continue
             symbols = [node.name for node in tree.body

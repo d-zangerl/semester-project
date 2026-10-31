@@ -9,6 +9,22 @@ from pathlib import Path
 from .projects import path_matches
 
 
+_PARSE_ERRORS = (SyntaxError, ValueError, MemoryError, RecursionError)
+
+
+def split_lines(text: str) -> list[str]:
+    """Split on line endings only, keeping them, so line numbers agree with Python's parser."""
+    return re.findall(r"[^\n]*\n|[^\n]+", text)
+
+
+def _newline_of(lines: list[str]) -> str:
+    return "\r\n" if lines and lines[0].endswith("\r\n") else "\n"
+
+
+def _with_newline(text: str, newline: str) -> str:
+    return text.replace("\r\n", "\n").replace("\n", newline)
+
+
 class RepositoryTools:
     """File access constrained to one task workspace."""
 
@@ -55,7 +71,7 @@ class RepositoryTools:
             content = data.decode("utf-8")
         except UnicodeDecodeError as error:
             raise ValueError("Binary files cannot be read as text.") from error
-        lines = content.splitlines(True)
+        lines = split_lines(content)
         total = len(lines)
         explicit = start is not None or end is not None
         for value in (start, end):
@@ -90,7 +106,8 @@ class RepositoryTools:
                 data = file.read_bytes()
                 if b"\x00" in data:
                     continue
-                for number, line in enumerate(data.decode("utf-8").splitlines(), 1):
+                for number, line in enumerate(split_lines(data.decode("utf-8")), 1):
+                    line = line.rstrip("\r\n")
                     if query.casefold() in line.casefold():
                         matches.append({"path": file.relative_to(self.workspace).as_posix(), "line": number, "text": line[:1000]})
                         if len(matches) >= self.max_results:
@@ -109,7 +126,7 @@ class RepositoryTools:
             relative = file.relative_to(self.workspace).as_posix()
             try:
                 parsed.append((relative, ast.parse(file.read_bytes(), filename=relative)))
-            except (SyntaxError, ValueError, OSError):
+            except (*_PARSE_ERRORS, OSError):
                 unparsable.append(relative)
         return parsed, unparsable
 
@@ -192,6 +209,15 @@ class RepositoryTools:
             raise ValueError("Git state is not available for this task.")
         return {"diff": self.history.diff_since_start()}
 
+    def _read_for_edit(self, file: Path) -> str:
+        """The whole file, with its line endings intact."""
+        if file.stat().st_size > self.max_file_bytes:
+            raise ValueError(f"File exceeds the {self.max_file_bytes}-byte edit limit.")
+        try:
+            return file.read_bytes().decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("Binary files cannot be edited as text.") from error
+
     def edit_file(self, path: str, content: str) -> dict:
         file = self._resolve(path, allow_missing=True)
         if self._excluded(file) or file.exists() and not file.is_file():
@@ -211,14 +237,14 @@ class RepositoryTools:
             raise ValueError("Edit path must identify an allowed file.")
         if not isinstance(old, str) or not isinstance(new, str) or not old:
             raise ValueError("Replace needs non-empty 'old' text and text 'new'.")
-        text = self.read_file(path)["content"]
+        text = self._read_for_edit(file)
         found = text.count(old)
         if found > 1:
             numbers = [str(text.count("\n", 0, match.start()) + 1) for match in re.finditer(re.escape(old), text)]
             raise ValueError(f"'old' matches {found} times in {path} (lines {', '.join(numbers[:10])}); "
                              "include neighbouring lines so it matches exactly once.")
         if found == 0:
-            source_lines = text.splitlines(keepends=True)
+            source_lines = split_lines(text)
             old_lines = textwrap.dedent(old.strip("\r\n")).splitlines()
             matching_starts = []
             for start in range(len(source_lines) - len(old_lines) + 1):
@@ -230,9 +256,9 @@ class RepositoryTools:
                 start = matching_starts[0]
                 end = start + len(old_lines)
                 segment = source_lines[start:end]
-                indent = segment[0][:len(segment[0]) - len(segment[0].lstrip())]
+                indent = min((line[:len(line) - len(line.lstrip())] for line in segment if line.strip()), key=len)
                 newline = "\r\n" if segment[-1].endswith("\r\n") else "\n"
-                replacement_lines = textwrap.dedent(new).splitlines()
+                replacement_lines = textwrap.dedent(new).split("\n")
                 ends_with_newline = segment[-1].endswith(("\n", "\r"))
                 replacement = [
                     (indent + line if line else "") +
@@ -259,12 +285,7 @@ class RepositoryTools:
             raise ValueError("Edit path must identify an allowed file.")
         if isinstance(after_line, bool) or not isinstance(after_line, int) or not isinstance(text, str) or not text.strip():
             raise ValueError("Insert needs an integer 'after_line' and non-empty text.")
-        if file.stat().st_size > self.max_file_bytes:
-            raise ValueError(f"File exceeds the {self.max_file_bytes}-byte edit limit.")
-        try:
-            lines = file.read_text(encoding="utf-8").splitlines(keepends=True)
-        except UnicodeDecodeError as error:
-            raise ValueError("Binary files cannot be edited as text.") from error
+        lines = split_lines(self._read_for_edit(file))
         if not 0 <= after_line <= len(lines):
             raise ValueError(f"'after_line' must be between 0 and {len(lines)}; {path} only has {len(lines)} lines.")
         block = text.rstrip("\n").splitlines()
@@ -272,9 +293,10 @@ class RepositoryTools:
             anchor = lines[after_line - 1]
             indent = anchor[:len(anchor) - len(anchor.lstrip())]
             block = [indent + line if line.strip() else line for line in block]
+        newline = _newline_of(lines)
         if lines and after_line and not lines[after_line - 1].endswith("\n"):
-            lines[after_line - 1] += "\n"
-        lines[after_line:after_line] = [line + "\n" for line in block]
+            lines[after_line - 1] += newline
+        lines[after_line:after_line] = [line + newline for line in block]
         return self.edit_file(path, "".join(lines))
 
     def replace_lines(self, path: str, start_line: int, end_line: int, text: str) -> dict:
@@ -286,18 +308,14 @@ class RepositoryTools:
             raise ValueError("'start_line' and 'end_line' must be integers.")
         if not isinstance(text, str):
             raise ValueError("Replacement text must be text.")
-        if file.stat().st_size > self.max_file_bytes:
-            raise ValueError(f"File exceeds the {self.max_file_bytes}-byte edit limit.")
-        try:
-            lines = file.read_text(encoding="utf-8").splitlines(keepends=True)
-        except UnicodeDecodeError as error:
-            raise ValueError("Binary files cannot be edited as text.") from error
+        lines = split_lines(self._read_for_edit(file))
         total = len(lines)
         if not 1 <= start_line <= end_line <= total:
             raise ValueError(f"Line range must be between 1 and {total} with start_line <= end_line.")
-        replacement = text.splitlines(keepends=True)
-        if replacement and lines[end_line - 1].endswith(("\n", "\r")) and not text.endswith(("\n", "\r")):
-            replacement[-1] += "\n"
+        newline = _newline_of(lines)
+        replacement = split_lines(_with_newline(text, newline))
+        if replacement and lines[end_line - 1].endswith("\n") and not text.endswith("\n"):
+            replacement[-1] += newline
         updated = lines[:start_line - 1] + replacement + lines[end_line:]
         return self.edit_file(path, "".join(updated))
 
@@ -309,14 +327,12 @@ class RepositoryTools:
             raise ValueError("Function name must be a Python identifier.")
         if not isinstance(content, str) or len(content.encode("utf-8")) > self.max_file_bytes:
             raise ValueError(f"Replacement function must be text no larger than {self.max_file_bytes} bytes.")
-        if file.stat().st_size > self.max_file_bytes:
-            raise ValueError(f"File exceeds the {self.max_file_bytes}-byte edit limit.")
+        original = self._read_for_edit(file)
         try:
-            original = file.read_text(encoding="utf-8")
             tree = ast.parse(original, filename=path)
             replacement_tree = ast.parse(textwrap.dedent(content), filename=path)
-        except (UnicodeDecodeError, SyntaxError) as error:
-            raise ValueError(f"Python function replacement could not be parsed: {error}") from error
+        except _PARSE_ERRORS as error:
+            raise ValueError(f"Python function replacement could not be parsed: {type(error).__name__}") from error
         matches = [
             node for node in tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
@@ -330,13 +346,13 @@ class RepositoryTools:
             raise ValueError(f"Replacement must contain only an undecorated function named {name!r}.")
 
         target = matches[0]
-        lines = original.splitlines(keepends=True)
+        lines = split_lines(original)
         start = target.lineno - 1
         end = target.end_lineno
         indent = lines[start][:len(lines[start]) - len(lines[start].lstrip())]
         newline = "\r\n" if lines[end - 1].endswith("\r\n") else "\n"
-        replacement_lines = textwrap.dedent(content.strip("\r\n")).splitlines()
-        ends_with_newline = lines[end - 1].endswith(("\n", "\r"))
+        replacement_lines = textwrap.dedent(content.strip("\r\n")).split("\n")
+        ends_with_newline = lines[end - 1].endswith("\n")
         replacement = [
             (indent + line if line else "") +
             (newline if index < len(replacement_lines) - 1 or ends_with_newline else "")

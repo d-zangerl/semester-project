@@ -445,7 +445,8 @@ class AgentController:
             insertion = "after_line" in args
             line_replacement = "start_line" in args or "end_line" in args
             function_replacement = "function" in args or "function_content" in args
-            if sum((whole_file, replacement, insertion, line_replacement, function_replacement)) != 1 \
+            stray_text = "text" in args and not (insertion or line_replacement)
+            if stray_text or sum((whole_file, replacement, insertion, line_replacement, function_replacement)) != 1 \
                     or (replacement and not {"old", "new"} <= args.keys()) \
                     or (insertion and not {"after_line", "text"} <= args.keys()) \
                     or (line_replacement and not {"start_line", "end_line", "text"} <= args.keys()) \
