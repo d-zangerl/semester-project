@@ -166,7 +166,6 @@ Core tests use scripted models and a fake container runner, so they need no acco
 - LION needs the FH network or VPN, is best-effort, and can be limited or revoked. Ollama is the fallback, and small local models may need several attempts.
 - Files a check creates outside the allowed changes are left out of the diff and of approval, but they do exist in the workspace.
 - Restored or newly created workspace files are not world-writable, which is fine on Docker Desktop but could stop a container's non-root user writing them on Linux.
-- Cancelling signals a saved process ID, which could in principle have been reused after a crash.
 - This is a single-user tool, not a multi-user security boundary.
 
 ## Credits

@@ -194,6 +194,18 @@ def process_exists(pid: int) -> bool:
     return True
 
 
+def process_start_time(pid: int) -> str | None:
+    """Identifies a process across process ID reuse; None when it no longer exists."""
+    if not process_exists(pid):
+        return None
+    try:
+        done = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() or None
+
+
 class ExecutionEnvironment:
     """Runs fixed, configured checks in new, locked-down containers, and fails closed."""
 

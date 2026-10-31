@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from src.coding_harness.core import UnknownTaskError
 from src.coding_harness.interactive import InteractiveSession
 from tests.test_cli import saved_task
 from tests.test_task_core import CoreTestCase, ScriptedModel, edit, final
@@ -106,6 +107,24 @@ class RoutingTests(unittest.TestCase):
         session.handle_line("/diff")
 
         self.assertIn("UNAVAILABLE: Docker is down", self.lines[-1])
+
+    def test_a_mistyped_task_id_does_not_break_the_prompt(self):
+        session = self.session()
+        self.core.show.side_effect = UnknownTaskError("No task with ID 'nope'.")
+
+        session.handle_line("/resume nope")
+        session.wait()
+
+        self.assertIsNone(session.current_task)
+        self.assertIn("No task", self.lines[-1])
+        self.assertIn("demo", session.status_line())
+
+    def test_the_status_line_never_raises(self):
+        session = self.session()
+        session.current_task = "gone"
+        self.core.show.side_effect = UnknownTaskError("gone")
+
+        self.assertIn("demo", session.status_line())
 
     def test_the_status_line_shows_limits(self):
         session = self.session()

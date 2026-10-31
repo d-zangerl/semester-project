@@ -77,6 +77,9 @@ class RepositoryTools:
         for value in (start, end):
             if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
                 raise ValueError("Line numbers must be integers.")
+        if total == 0 and not explicit:
+            return {"path": file.relative_to(self.workspace).as_posix(), "content": "", "start": 0, "end": 0,
+                    "total_lines": 0, "truncated": False}
         first = 1 if start is None else start
         last = min(total, first + self.read_window_lines - 1) if end is None else end
         if first < 1 or last < first:
@@ -289,7 +292,8 @@ class RepositoryTools:
         if not 0 <= after_line <= len(lines):
             raise ValueError(f"'after_line' must be between 0 and {len(lines)}; {path} only has {len(lines)} lines.")
         block = text.rstrip("\n").splitlines()
-        if after_line and block[0] == block[0].lstrip():
+        top_level_definition = block[0].startswith(("def ", "async def ", "class ", "@"))
+        if after_line and block[0] == block[0].lstrip() and not top_level_definition:
             anchor = lines[after_line - 1]
             indent = anchor[:len(anchor) - len(anchor.lstrip())]
             block = [indent + line if line.strip() else line for line in block]

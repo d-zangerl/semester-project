@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY, project TEXT NOT NULL, request TEXT NOT NULL, start_commit TEXT, first_commit TEXT NOT NULL,
     workspace TEXT NOT NULL, git_directory TEXT NOT NULL, settings TEXT NOT NULL, limits TEXT NOT NULL,
     state TEXT NOT NULL, reason TEXT, final_response TEXT NOT NULL DEFAULT '', counters TEXT NOT NULL DEFAULT '{}',
-    checks TEXT NOT NULL DEFAULT '[]', cancel_requested INTEGER NOT NULL DEFAULT 0, pid INTEGER,
+    checks TEXT NOT NULL DEFAULT '[]', cancel_requested INTEGER NOT NULL DEFAULT 0, pid INTEGER, pid_started TEXT,
     review_decision TEXT, created TEXT NOT NULL, updated TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS runs (
@@ -43,6 +43,9 @@ class TaskStore:
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(_SCHEMA)
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
+            if "pid_started" not in columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN pid_started TEXT")
 
     @contextmanager
     def _connection(self):
@@ -86,7 +89,7 @@ class TaskStore:
 
     def save_outcome(self, task_id: str, state: str, reason: str | None, final_response: str,
                      checks: list[dict] | None) -> None:
-        columns = dict(state=state, reason=reason, final_response=final_response, pid=None)
+        columns = dict(state=state, reason=reason, final_response=final_response, pid=None, pid_started=None)
         if checks is not None:
             columns["checks"] = json.dumps(checks)
         self._update(task_id, **columns)
@@ -102,12 +105,19 @@ class TaskStore:
             row = connection.execute("SELECT cancel_requested FROM tasks WHERE id = ?", (task_id,)).fetchone()
         return bool(row and row["cancel_requested"])
 
-    def begin_run(self, task_id: str, pid: int) -> int:
+    def clear_cancel(self, task_id: str) -> None:
+        self._update(task_id, cancel_requested=0)
+
+    def save_checks(self, task_id: str, checks: list[dict]) -> None:
+        self._update(task_id, checks=json.dumps(checks))
+
+    def begin_run(self, task_id: str, pid: int, pid_started: str | None = None) -> int:
         with self._connection() as connection:
             run_id = connection.execute("INSERT INTO runs (task_id, pid, started) VALUES (?, ?, ?)",
                                         (task_id, pid, _now())).lastrowid
-            connection.execute("UPDATE tasks SET pid = ?, state = 'running', reason = NULL, cancel_requested = 0, "
-                               "updated = ? WHERE id = ?", (pid, _now(), task_id))
+            connection.execute("UPDATE tasks SET pid = ?, pid_started = ?, state = 'running', reason = NULL, "
+                               "final_response = '', checks = '[]', updated = ? WHERE id = ?",
+                               (pid, pid_started, _now(), task_id))
         return run_id
 
     def end_run(self, run_id: int, outcome: str) -> None:

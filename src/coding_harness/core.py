@@ -15,7 +15,7 @@ from typing import Callable, Mapping
 
 from .agent import AgentController, RunCounters, RunLimits, TaskResult
 from .context import ContextLimits, ContextManager
-from .execution import CheckResult, DockerRunner, ExecutionEnvironment, process_exists
+from .execution import CheckResult, DockerRunner, ExecutionEnvironment, process_start_time
 from .projects import Project, path_matches
 from .repository import RepositoryTools
 from .review import apply_changes, target_differences
@@ -132,8 +132,9 @@ class _StoreRecorder:
         self.store.save_progress(self.task_id, dataclasses.asdict(counters))
 
     def checks(self, verification) -> None:
-        self.store.add_event(self.task_id, self.run_id, "verification",
-                             {"checks": [dataclasses.asdict(check) for check in verification.checks]})
+        checks = [dataclasses.asdict(check) for check in verification.checks]
+        self.store.add_event(self.task_id, self.run_id, "verification", {"checks": checks})
+        self.store.save_checks(self.task_id, checks)
         # Checks can leave files behind; the saved working-copy state includes them.
         workspace_hash = hash_workspace(self.repository.workspace)
         if workspace_hash != self._hash:
@@ -198,7 +199,7 @@ class TaskCore:
         workspace = repository.workspace
         limits = RunLimits(**json.loads(saved["limits"]))
         self._remove_stale_containers()
-        run_id = self.store.begin_run(task_id, os.getpid())
+        run_id = self.store.begin_run(task_id, os.getpid(), process_start_time(os.getpid()))
         environment = ExecutionEnvironment(checks=project.checks, runner=self.runner, run_id=f"{task_id}-{run_id}")
         recorder = _StoreRecorder(self.store, repository, task_id, run_id)
         recorder._hash = hash_workspace(workspace)
@@ -260,16 +261,20 @@ class TaskCore:
     def cancel(self, task_id: str) -> bool:
         """Ask an active run to stop. Returns False when the task has no active run."""
         row = self._row(task_id)
-        if row["state"] != "running":
+        if row["state"] != "running" or (row["pid"] and not self._run_is_alive(row)):
             return False
         self.store.request_cancel(task_id)
-        pid = row["pid"]
-        if pid and pid != os.getpid() and process_exists(pid):
+        if row["pid"] and row["pid"] != os.getpid():
             try:
-                os.kill(pid, signal.SIGTERM)
+                os.kill(row["pid"], signal.SIGTERM)
             except OSError:
                 pass
         return True
+
+    @staticmethod
+    def _run_is_alive(row) -> bool:
+        """The saved process is still the one that began the run, not a process that reused its ID."""
+        return bool(row["pid"]) and process_start_time(row["pid"]) == row["pid_started"]
 
     def _row(self, task_id: str):
         row = self.store.task(task_id)
@@ -278,7 +283,7 @@ class TaskCore:
         return row
 
     def _paused(self, task_id: str, row, repository: WorkspaceRepository, reason: str, emit) -> StartedTask:
-        self.store.save_outcome(task_id, "paused", reason, row["final_response"], None)
+        self.store.save_outcome(task_id, "paused", reason, row["final_response"], [])
         emit(f"Paused: {reason}")
         counters = RunCounters(**json.loads(row["counters"]))
         return StartedTask(TaskResult("", None, counters, reason, None, "paused"), repository.workspace, None,
@@ -312,7 +317,7 @@ class TaskCore:
             raise ValueError(f"Task {task_id} was already reviewed: {row['review_decision']}.")
         if instruction is None and row["state"] == "completed":
             raise ValueError(f"Task {task_id} already completed; review it or send a follow-up.")
-        if row["state"] == "running" and row["pid"] and row["pid"] != os.getpid() and process_exists(row["pid"]):
+        if row["state"] == "running" and self._run_is_alive(row):
             raise ValueError(f"Task {task_id} still has an active run in process {row['pid']}.")
         repository = WorkspaceRepository(row["git_directory"], row["workspace"])
         project = self.projects.get(row["project"])
@@ -349,6 +354,10 @@ class TaskCore:
             self.store.add_event(task_id, None, "message", {"role": "user", "content": note})
         if instruction is not None:
             self.store.add_event(task_id, None, "instruction", {"text": instruction})
+            self.store.add_event(task_id, None, "message", {"role": "user", "content": f"Follow-up instruction: {instruction}"})
+        elif self._history(task_id)[-1]["role"] == "assistant":
+            self.store.add_event(task_id, None, "message", {"role": "user", "content": "The run was resumed. Continue the task."})
+        self.store.clear_cancel(task_id)
         return self._run(task_id, project, repository, emit, counters=RunCounters(**json.loads(row["counters"])),
                          history=self._history(task_id))
 
@@ -368,7 +377,7 @@ class TaskCore:
         row = self._row(task_id)
         if row["review_decision"]:
             raise ValueError(f"Task {task_id} was already reviewed: {row['review_decision']}.")
-        if row["state"] == "running" and row["pid"] and process_exists(row["pid"]) and row["pid"] != os.getpid():
+        if row["state"] == "running" and self._run_is_alive(row):
             raise ValueError(f"Task {task_id} still has an active run.")
         return row
 
@@ -432,13 +441,9 @@ class TaskCore:
             errors += (row["reason"],)
         history = tuple(self._history(task_id))
         state = row["state"]
-        if state == "running" and row["pid"] and not process_exists(row["pid"]):
+        if state == "running" and row["pid"] and not self._run_is_alive(row):
             state = "interrupted"
         checks = tuple(CheckResult(**check) for check in json.loads(row["checks"]))
-        if not checks:
-            verifications = self.store.events(task_id, "verification")
-            if verifications:
-                checks = tuple(CheckResult(**check) for check in verifications[-1]["checks"])
         changed: tuple[str, ...] = ()
         diff = ""
         if include_diff and Path(row["workspace"]).is_dir():

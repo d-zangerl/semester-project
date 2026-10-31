@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import signal
 import threading
 from typing import Callable
 
@@ -150,6 +151,7 @@ class InteractiveSession:
         choices = {options[part]: True for part in parts if part in options}
         task_ids = [part for part in parts if part not in options]
         task_id = self._task_id(task_ids[0] if task_ids else "")
+        self.core.show(task_id, include_diff=False)
         self.current_task = task_id
         self._in_background(lambda: self.core.resume(task_id, progress=self._progress, **choices))
 
@@ -177,7 +179,10 @@ class InteractiveSession:
         project = self.project or "(no project)"
         if not self.current_task:
             return f"{project} · /help for commands"
-        counters = self.core.show(self.current_task, include_diff=False)
+        try:
+            counters = self.core.show(self.current_task, include_diff=False)
+        except (UnknownTaskError, OSError, ValueError):
+            return f"{project} · /help for commands"
         hint = "esc to cancel" if self.running else counters.state
         return (f"{project} · task {self.current_task} · {counters.counters.actions}/{counters.limits.actions} actions · "
                 f"{counters.counters.tokens}/{counters.limits.tokens} tokens · {hint}")
@@ -211,7 +216,9 @@ def run_interactive(core_factory) -> int:
         if session.cancel_current():
             session.write("Cancelling.")
 
-    prompt = PromptSession(key_bindings=bindings, bottom_toolbar=session.status_line, refresh_interval=0.5)
+    # `harness cancel` from another terminal signals this process; the core's watcher does the stopping.
+    signal.signal(signal.SIGTERM, lambda number, frame: session.cancel_current())
+    prompt: PromptSession = PromptSession(key_bindings=bindings, bottom_toolbar=session.status_line, refresh_interval=0.5)
     session.write("Coding harness. Type a request, or /help.")
     with patch_stdout(raw=True):
         while not session.finished:
