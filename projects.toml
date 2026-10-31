@@ -1,0 +1,13 @@
+# Allowed projects. Tasks can only run against the projects listed here.
+[projects.openstock]
+path = "target-repository"
+allowed_changes = ["quotes.py", "app.py", "templates/**", "static/**", "tests/**"]
+# Credentials and local-only material never enter a task workspace.
+excluded_paths = ["config.json", "config.local.json", "logs", "quotes.json", "data"]
+fixtures = ["data/openstock.db"]
+
+[projects.openstock.checks]
+core = ["python", "tests/test_core.py"]
+
+[projects.openstock.generated_files]
+"config.json" = "config.example.json"

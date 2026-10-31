@@ -60,7 +60,7 @@ class UserInterface:
             core = TaskCore(model_client=model, environment_factory=self.execution_environment_factory,
                             workspace_factory=self.workspace_factory, task_log_directory=project_root)
             try:
-                started = core.start(repository, task, progress=lambda message: print(f"[progress] {message}"))
+                started = core.start_in_copy(repository, task, progress=lambda message: print(f"[progress] {message}"))
                 result, workspace, environment = started.result, started.workspace, started.environment
             except KeyboardInterrupt:
                 print("\nTask interrupted; workspace retained for diagnosis.")

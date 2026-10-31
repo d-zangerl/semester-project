@@ -6,6 +6,8 @@ import re
 import textwrap
 from pathlib import Path
 
+from .projects import path_matches
+
 
 class RepositoryTools:
     """File access constrained to one task workspace."""
@@ -15,15 +17,16 @@ class RepositoryTools:
     _excluded_suffixes = {".pyc", ".sqlite", ".db", ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip"}
 
     def __init__(self, workspace: str | Path, *, max_file_bytes: int = 256 * 1024, max_results: int = 200,
-                 read_window_lines: int = 200):
+                 read_window_lines: int = 200, allowed_changes: tuple[str, ...] | None = None):
         self.workspace = Path(workspace).resolve(strict=True)
+        self.allowed_changes = allowed_changes
         self.max_file_bytes = max_file_bytes
         self.read_window_lines = read_window_lines
         self.max_results = max_results
 
     def for_workspace(self, workspace: str | Path) -> "RepositoryTools":
         return RepositoryTools(workspace, max_file_bytes=self.max_file_bytes, max_results=self.max_results,
-                               read_window_lines=self.read_window_lines)
+                               read_window_lines=self.read_window_lines, allowed_changes=self.allowed_changes)
 
     def list_files(self, path: str = ".") -> dict:
         directory = self._resolve(path)
@@ -97,6 +100,9 @@ class RepositoryTools:
         file = self._resolve(path, allow_missing=True)
         if self._excluded(file) or file.exists() and not file.is_file():
             raise ValueError("Edit path must identify an allowed file.")
+        relative = file.relative_to(self.workspace).as_posix()
+        if self.allowed_changes is not None and not path_matches(relative, self.allowed_changes):
+            raise ValueError(f"{relative} is outside this task's allowed changes: {', '.join(self.allowed_changes)}.")
         if not isinstance(content, str) or len(content.encode("utf-8")) > self.max_file_bytes:
             raise ValueError(f"File content must be text no larger than {self.max_file_bytes} bytes.")
         file.parent.mkdir(parents=True, exist_ok=True)
