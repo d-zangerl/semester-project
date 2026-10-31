@@ -9,6 +9,7 @@ from pathlib import Path
 from src.coding_harness.execution import (
     DEFAULT_IMAGE, ContainerSpec, DockerRunner, ExecutionEnvironment, docker_arguments,
 )
+from src.coding_harness.projects import load_projects
 from tests.fakes import LocalRunner
 
 
@@ -194,6 +195,28 @@ print("confined")
         self.assertFalse(worker.is_alive())
         self.assertFalse(results[0].passed)
         self.assertEqual(self.containers(environment.run_id), "")
+
+    def syntax_check(self):
+        checks = load_projects(Path(__file__).resolve().parents[1] / "projects.toml")["openstock"].checks
+        return ExecutionEnvironment(checks={"syntax": checks["syntax"]}).run_check("syntax", self.workspace)
+
+    def test_the_syntax_check_catches_a_file_that_does_not_parse(self):
+        (self.workspace / "tests").mkdir()
+        (self.workspace / "tests" / "broken.py").write_text("def broken():\nreturn 1\n", encoding="utf-8")
+
+        result = self.syntax_check()
+
+        self.assertFalse(result.passed)
+        self.assertIn("broken.py", result.stdout + result.stderr)
+
+    def test_the_syntax_check_passes_valid_code_and_leaves_no_files_behind(self):
+        (self.workspace / "tests").mkdir()
+        (self.workspace / "tests" / "fine.py").write_text("x = 1\n", encoding="utf-8")
+
+        result = self.syntax_check()
+
+        self.assertTrue(result.passed, result.stdout + result.stderr + str(result.error))
+        self.assertEqual([path.name for path in self.workspace.rglob("*.pyc")], [])
 
     def test_completed_check_leaves_no_container(self):
         environment, _ = self.run_source("print('done')")

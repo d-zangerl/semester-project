@@ -8,6 +8,8 @@ fixtures = ["data/openstock.db"]
 
 [projects.openstock.checks]
 core = ["python", "tests/test_core.py"]
+# Python-wide parse check, because core does not load every module. Bytecode goes to the container's temp folder.
+syntax = ["python", "-X", "pycache_prefix=/tmp/pyc", "-m", "compileall", "-q", "."]
 
 [projects.openstock.generated_files]
 "config.json" = "config.example.json"

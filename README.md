@@ -35,6 +35,8 @@ Any OpenAI-compatible endpoint works. For local Ollama use `OPENAI_BASE_URL=http
 
 `projects.toml` lists what tasks may run against. Each project sets its path, configured checks, allowed changes, excluded paths, fixtures, and generated files. Anything not listed is refused.
 
+OpenStock has two configured checks. `core` runs its regression tests, which cover the database and business operations but do not load `app.py` or `quotes.py`. `syntax` confirms every Python file parses. Neither proves a feature works or finds errors such as undefined names.
+
 ## Using it
 
 ```bash
@@ -161,6 +163,7 @@ Core tests use scripted models and a fake container runner, so they need no acco
 
 ## Known limits
 
+- No lint tool is configured yet: `syntax` only finds files that don't parse.
 - Symbol and dependency tools understand Python only; text search covers everything else.
 - Token counts for context are estimates, at 4 characters per token.
 - LION needs the FH network or VPN, is best-effort, and can be limited or revoked. Ollama is the fallback, and small local models may need several attempts.
