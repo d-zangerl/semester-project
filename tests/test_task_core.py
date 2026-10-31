@@ -11,6 +11,7 @@ import unittest.mock
 from pathlib import Path
 
 from src.coding_harness.agent import RunLimits
+from src.coding_harness.cli import PROJECT_ROOT, default_core
 from src.coding_harness.context import CONTEXT_LIMIT_TOKENS, ContextLimits
 from src.coding_harness.core import TaskCore, UnknownProjectError
 from src.coding_harness.execution import CheckResult, process_start_time
@@ -148,6 +149,35 @@ class AllowedProjectTests(CoreTestCase):
         self.core(ScriptedModel(tool("list"), final())).start("demo", "Inspect", progress=seen.append)
 
         self.assertTrue(any("Tool action" in message for message in seen))
+
+
+class TaskLogTests(CoreTestCase):
+    def logs(self, directory):
+        return sorted(path.name for path in directory.glob("coding-harness-task-*.log"))
+
+    def test_only_the_five_newest_logs_are_kept(self):
+        directory = self.root / "logs"
+        directory.mkdir()
+        (directory / "unrelated.txt").write_text("keep me", encoding="utf-8")
+        seen = []
+        for number in range(7):
+            self.core(ScriptedModel(tool("list"), final()), task_log_directory=directory).start("demo", f"Task {number}")
+            seen.append(self.logs(directory))
+
+        self.assertEqual([len(names) for names in seen], [1, 2, 3, 4, 5, 5, 5])
+        kept = self.logs(directory)
+        self.assertEqual(kept[:-1], seen[-2][1:])
+        requests = [path.read_text(encoding="utf-8") for path in map(directory.joinpath, kept)]
+        for number, text in zip(range(2, 7), requests):
+            self.assertIn(f"Task {number}", text)
+        self.assertTrue((directory / "unrelated.txt").exists())
+
+    def test_the_commands_write_logs_to_the_projects_logs_folder(self):
+        with unittest.mock.patch("src.coding_harness.cli.client_from_environment"), \
+                unittest.mock.patch("src.coding_harness.cli.load_projects", return_value={}):
+            core = default_core()
+
+        self.assertEqual(Path(core.task_log_directory), PROJECT_ROOT / "logs")
 
 
 class FailingThenPassingCheck:

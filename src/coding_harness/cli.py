@@ -16,7 +16,8 @@ OUTCOME_EXIT_CODES = {"completed": 0, "failed": 1, "paused": 2, "cancelled": 130
 def default_core(*, with_model: bool = True) -> TaskCore:
     return TaskCore(model_client=client_from_environment() if with_model else None,
                     projects=load_projects(PROJECT_ROOT / "projects.toml"),
-                    state_directory=PROJECT_ROOT / ".harness")
+                    state_directory=PROJECT_ROOT / ".harness",
+                    task_log_directory=PROJECT_ROOT / "logs")
 
 
 def check_status(check: CheckResult) -> str:

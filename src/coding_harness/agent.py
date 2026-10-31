@@ -13,6 +13,8 @@ from typing import Callable
 
 from .model import ModelUnavailableError, estimate_tokens
 
+MAX_TASK_LOGS = 5
+
 
 @dataclass(frozen=True)
 class RunLimits:
@@ -89,7 +91,7 @@ class AgentController:
                self.limits.tokens) < 1 or self.limits.retries < 0 or self.limits.fix_attempts < 0:
             raise ValueError("Run limits must be positive; retries and fix attempts may be zero.")
         self.progress = progress or (lambda message: None)
-        self.task_log_directory = Path(task_log_directory) if task_log_directory else Path(__file__).resolve().parents[2]
+        self.task_log_directory = Path(task_log_directory) if task_log_directory else Path(__file__).resolve().parents[2] / "logs"
         self.task_log_path: Path | None = None
         self._task_log = None
         self.recorder = recorder or NullRecorder()
@@ -118,8 +120,15 @@ class AgentController:
             except FileExistsError:
                 continue
         self.task_log_path = path
+        self._remove_old_task_logs()
         self._emit_progress(f"Task log: {path}")
         self._emit_progress(f"Task started: {task.strip()}")
+
+    def _remove_old_task_logs(self) -> None:
+        # Names start with a UTC timestamp, so they sort oldest first.
+        logs = sorted(self.task_log_directory.glob("coding-harness-task-*.log"), key=lambda path: path.name)
+        for old in logs[:-MAX_TASK_LOGS]:
+            old.unlink(missing_ok=True)
 
     def run_task(self, task: str, workspace: str | Path, *, baseline: dict | None = None,
                  counters: RunCounters | None = None, history: list[dict] | None = None,
